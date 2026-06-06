@@ -16,6 +16,7 @@ This module is fully additive and does not modify existing capture paths
 """
 
 import asyncio
+import fcntl
 import os
 import shutil
 import signal
@@ -61,7 +62,7 @@ _READ_CHUNK = 65536
 class H264StreamService:
     """Per-UDID fMP4 broadcaster.  Instances are managed by the WS handler."""
 
-    START_TIMEOUT: float = 30.0  # seconds to wait for the init (moov) segment
+    START_TIMEOUT: float = 10.0  # seconds to wait for the init (moov) segment
 
     def __init__(self, udid: str) -> None:
         self.udid = udid
@@ -89,39 +90,76 @@ class H264StreamService:
             return True
         self._loop = loop
 
-        # Use an anonymous pipe (os.pipe()) instead of a named FIFO.
-        # Named FIFOs with simctl --force caused unlink+recreate: simctl would
-        # delete our FIFO and create a new regular file, breaking the ffmpeg
-        # connection.  An anonymous pipe avoids this: both ends are immediately
-        # connected and the path is never exposed to simctl for manipulation.
-        #
-        # simctl writes to /dev/fd/{w_fd}: on macOS /dev/fd/N is a magic path
-        # that dups the inherited fd N when opened, connecting to our pipe.
-        # ffmpeg reads via pipe:{r_fd}: ffmpeg's pipe: protocol uses the fd
-        # directly without any open() call, so no blocking or path issues.
+        # Kill any stale simctl recordVideo processes for this UDID before
+        # starting a new one.  Stale processes hold the recording lock, causing
+        # the new simctl to wait indefinitely even with --force.
         try:
-            r_fd, w_fd = os.pipe()
+            result = subprocess.run(
+                ["pkill", "-SIGINT", "-f",
+                 f"simctl io {self.udid} recordVideo"],
+                capture_output=True, timeout=3,
+            )
+            if result.returncode == 0:
+                logger.info(
+                    f"H264StreamService: killed stale simctl recording "
+                    f"for {self.udid}, waiting for release..."
+                )
+                time.sleep(0.8)  # allow the lock to be released
+        except Exception:
+            pass
+
+        # Named FIFO approach:
+        # 1. Create FIFO.
+        # 2. Open read-end with O_RDONLY|O_NONBLOCK (returns immediately even
+        #    without a writer), then clear O_NONBLOCK so subsequent reads block.
+        # 3. Start simctl: its open(fifo_path, O_WRONLY) succeeds immediately
+        #    because r_fd already satisfies the "reader present" requirement.
+        # 4. Pass r_fd to ffmpeg via pass_fds + "-i pipe:{r_fd}" — no further
+        #    path-based open() call, no race, no blocking.
+        fifo_path = f"/tmp/ios_bridge_h264_{self.udid}_{os.getpid()}.pipe"
+        try:
+            if os.path.exists(fifo_path):
+                os.unlink(fifo_path)
+            os.mkfifo(fifo_path, mode=0o600)
         except Exception as e:
-            logger.error(f"H264StreamService: pipe() failed for {self.udid}: {e}")
+            logger.error(
+                f"H264StreamService: FIFO creation failed for {self.udid}: {e}"
+            )
+            return False
+        self._fifo_path = fifo_path
+
+        # Open read-end without blocking.
+        try:
+            r_fd = os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+            # Switch to blocking mode: reads should wait for data, not return EAGAIN.
+            flags = fcntl.fcntl(r_fd, fcntl.F_GETFL)
+            fcntl.fcntl(r_fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+        except Exception as e:
+            logger.error(
+                f"H264StreamService: FIFO read-end open failed for {self.udid}: {e}"
+            )
+            self._cleanup_processes()
             return False
 
-        # Launch simctl writing into the write-end of the anonymous pipe.
+        # Start simctl — no --force needed since stale processes were killed.
+        # r_fd being open means simctl's open(fifo_path, O_WRONLY) won't block.
         try:
             self._simctl = subprocess.Popen(
                 ["xcrun", "simctl", "io", self.udid,
-                 "recordVideo", "--codec=h264", "--force", f"/dev/fd/{w_fd}"],
-                pass_fds=(w_fd,),
+                 "recordVideo", "--codec=h264", fifo_path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
         except Exception as e:
-            logger.error(f"H264StreamService: simctl launch failed for {self.udid}: {e}")
+            logger.error(
+                f"H264StreamService: simctl launch failed for {self.udid}: {e}"
+            )
             os.close(r_fd)
-            os.close(w_fd)
+            self._cleanup_processes()
             return False
-        os.close(w_fd)  # parent no longer needs write-end; simctl has a dup
 
-        # Launch ffmpeg reading from the read-end via ffmpeg's pipe: protocol.
+        # Start ffmpeg with r_fd passed via pass_fds.
+        # pipe:{r_fd} tells ffmpeg to read from the fd directly (no open() call).
         try:
             self._ffmpeg = subprocess.Popen(
                 [
@@ -145,11 +183,13 @@ class H264StreamService:
                 bufsize=0,
             )
         except Exception as e:
-            logger.error(f"H264StreamService: ffmpeg launch failed for {self.udid}: {e}")
+            logger.error(
+                f"H264StreamService: ffmpeg launch failed for {self.udid}: {e}"
+            )
             os.close(r_fd)
             self._cleanup_processes()
             return False
-        os.close(r_fd)  # parent no longer needs read-end; ffmpeg has a dup
+        os.close(r_fd)  # parent no longer needs read-end; ffmpeg has its own dup
 
         self._running = True
 
@@ -231,7 +271,12 @@ class H264StreamService:
                 pass
             self._ffmpeg = None
 
-        # No FIFO or keepalive fds to clean up (anonymous pipe is used instead).
+        if self._fifo_path:
+            try:
+                os.unlink(self._fifo_path)
+            except Exception:
+                pass
+            self._fifo_path = None
 
     # ------------------------------------------------------------------
     # Reader / broadcaster
