@@ -67,7 +67,7 @@ _READ_CHUNK = 65536
 class H264StreamService:
     """Per-UDID fMP4 broadcaster.  Instances are managed by the WS handler."""
 
-    START_TIMEOUT: float = 10.0  # seconds to wait for the init (moov) segment
+    START_TIMEOUT: float = 20.0  # seconds to wait for the init (moov) segment
 
     def __init__(self, udid: str) -> None:
         self.udid = udid
@@ -156,15 +156,18 @@ class H264StreamService:
         self._relay_thread.start()
 
         # Start ffmpeg reading from r_fd via pass_fds (no path-based open()).
+        # Input format is explicitly 'mov' because simctl writes a MOV container;
+        # without -f mov ffmpeg may fail to detect the format on a non-seekable pipe.
         try:
             self._ffmpeg = subprocess.Popen(
                 [
                     _FFMPEG_EXE,
                     "-loglevel", "error",
+                    "-f", "mov",
                     "-fflags", "+nobuffer+discardcorrupt+igndts",
                     "-flags", "+low_delay",
-                    "-probesize", "1000000",
-                    "-analyzeduration", "1000000",
+                    "-probesize", "5000000",
+                    "-analyzeduration", "5000000",
                     "-i", f"pipe:{r_fd}",
                     "-c:v", "copy",
                     "-an",
@@ -288,6 +291,7 @@ class H264StreamService:
 
     def _relay_loop(self, output_path: str, w_fd: int) -> None:
         """Tail-follow simctl output file and forward bytes to ffmpeg via pipe."""
+        total_relayed = 0
         try:
             # Wait for simctl to create the file (it may take a moment after Popen).
             deadline = time.monotonic() + 8.0
@@ -307,6 +311,7 @@ class H264StreamService:
                     if chunk:
                         try:
                             os.write(w_fd, chunk)
+                            total_relayed += len(chunk)
                         except OSError:
                             break
                     else:
@@ -331,7 +336,10 @@ class H264StreamService:
                 pass
             if self._relay_w_fd == w_fd:
                 self._relay_w_fd = None
-            logger.info(f"H264StreamService relay exited for {self.udid}")
+            logger.info(
+                f"H264StreamService relay exited for {self.udid} "
+                f"(total_relayed={total_relayed} bytes)"
+            )
 
     def _drain_stderr(self, stream, name: str) -> None:
         try:
