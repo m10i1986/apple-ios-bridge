@@ -214,7 +214,7 @@ async def root():
 @app.get("/web", response_class=HTMLResponse)
 async def index(request: Request):
     """Main page - session list"""
-    return templates.TemplateResponse("session_list.html", {"request": request})
+    return templates.TemplateResponse(request, "session_list.html")
 
 @app.get("/control/{session_id}", response_class=HTMLResponse)
 async def control_page(request: Request, session_id: str):
@@ -224,8 +224,7 @@ async def control_page(request: Request, session_id: str):
     if not session_info:
         return HTMLResponse("Session not found", status_code=404)
 
-    return templates.TemplateResponse("control.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "control.html", context={
         "session_id": session_id,
         "session_info": session_info
     })
