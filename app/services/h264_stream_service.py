@@ -1,22 +1,21 @@
 """H.264 fragmented MP4 broadcaster for iOS simulators.
 
-Pipeline:
+Pipeline (single process, no external ffmpeg):
     xcrun simctl io <udid> recordVideo --codec=h264 --force <fifo>
-        -> (FIFO, MOV container with H.264 elementary stream)
-    ffmpeg -f mov -i <fifo> -c copy -movflags +frag_keyframe+empty_moov+...
-           -f mp4 pipe:1
-        -> (fragmented MP4 on stdout; remux only, no transcode)
+        -> (FIFO, MOV container with an H.264 elementary stream)
+    PyAV demux(MOV from FIFO) -> PyAV mux(fragmented MP4 to a capturing
+    file-like) -> top-level MP4 boxes parsed and broadcast to WS clients.
 
-This mirrors the proven IdbStreamService recordVideo pattern:
-  1. Create a named FIFO.
-  2. Launch ffmpeg FIRST with the FIFO PATH as input.  ffmpeg's libav opens
-     the read side natively (blocking O_RDONLY) and probes the MOV container,
-     exactly as required for a non-seekable pipe.  Running ffmpeg in its own
-     process means our event loop is never blocked by the open().
-  3. Launch simctl recordVideo (writer); its write-side open rendezvous with
-     ffmpeg's read side.  Blocking opens rendezvous regardless of order.
+This mirrors the proven IdbStreamService recordVideo pattern, which decodes
+the very same simctl FIFO via PyAV reliably on this host.  The crucial detail
+is that libav opens the FIFO read side natively in a reader THREAD (blocking
+O_RDONLY) and probes the MOV container; simctl --force then connects the write
+side.  Using an in-process PyAV reader (instead of a separate ffmpeg process)
+avoids the FIFO inode race that made the ffmpeg-subprocess approach fail with
+"Interrupted system call".
 
-The reader thread parses top-level MP4 boxes:
+The packets are remuxed (bitstream copy, no transcode) into fragmented MP4 so
+browsers/Electron can play them via Media Source Extensions:
     - Init segment: ftyp + moov  (cached, re-sent to each new client)
     - Media segments: moof + mdat  (broadcast to all connected clients)
 
@@ -26,36 +25,15 @@ This module is fully additive and does not modify existing capture paths
 
 import asyncio
 import os
-import shutil
 import signal
 import subprocess
 import threading
 import time
 from typing import Dict, Optional, Set
 
+import av # type: ignore
+
 from app.core.logging import logger
-
-
-def _resolve_ffmpeg() -> str:
-    """Return the ffmpeg executable path.
-
-    Preference order:
-    1. System PATH (``which ffmpeg``)
-    2. imageio-ffmpeg bundled binary
-    3. Bare ``'ffmpeg'`` (raises clear error at runtime if missing)
-    """
-    system = shutil.which("ffmpeg")
-    if system:
-        return system
-    try:
-        import imageio_ffmpeg  # type: ignore[import]
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        pass
-    return "ffmpeg"
-
-
-_FFMPEG_EXE = _resolve_ffmpeg()
 
 
 # Default MSE codec hint sent to clients.  simctl recordVideo --codec=h264
@@ -64,7 +42,26 @@ _FFMPEG_EXE = _resolve_ffmpeg()
 DEFAULT_MSE_MIME = 'video/mp4; codecs="avc1.640032"'
 
 _FRAG_DURATION_US = 100_000  # 100ms fragments for low latency
-_READ_CHUNK = 65536
+
+
+class _Fmp4Writer:
+    """Minimal write-only, non-seekable file-like for the PyAV MP4 muxer.
+
+    Deliberately exposes NO ``seek``/``tell`` so libav treats the target as a
+    non-seekable stream and emits a fragmented layout (moov first).  Every
+    chunk libav writes is forwarded to the service's fMP4 box parser.
+    """
+
+    def __init__(self, service: "H264StreamService") -> None:
+        self._service = service
+
+    def write(self, data) -> int:
+        b = bytes(data)
+        self._service._feed_bytes(b)
+        return len(b)
+
+    def flush(self) -> None:
+        pass
 
 
 class H264StreamService:
@@ -76,10 +73,19 @@ class H264StreamService:
         self.udid = udid
 
         self._simctl: Optional[subprocess.Popen] = None
-        self._ffmpeg: Optional[subprocess.Popen] = None
         self._fifo_path: Optional[str] = None
         self._reader_thread: Optional[threading.Thread] = None
         self._running = False
+
+        # PyAV containers (managed by the reader thread).
+        self._in_container = None
+        self._out_container = None
+
+        # fMP4 box-parser state (fed by the muxer's write callback).
+        self._parse_buffer = b""
+        self._init_accumulator = b""
+        self._init_collected = False
+        self._media_accumulator = b""
 
         self._lock = threading.Lock()
         self._init_segment: Optional[bytes] = None  # ftyp(+optional)+moov
@@ -116,9 +122,10 @@ class H264StreamService:
         except Exception:
             pass
 
-        # Create a named FIFO.  ffmpeg (started next) opens the read side by
-        # PATH, blocking until simctl connects the write side — the proven
-        # IdbStreamService pattern.
+        # Create a named FIFO.  The reader thread (started next) calls
+        # av.open(FIFO_PATH) so libav opens the read side natively (blocking
+        # O_RDONLY) and probes the MOV container — the proven IdbStreamService
+        # pattern.  simctl --force then connects the write side.
         fifo_path = f"/tmp/ios_bridge_h264_{self.udid}_{os.getpid()}.pipe"
         try:
             if os.path.exists(fifo_path):
@@ -129,38 +136,16 @@ class H264StreamService:
             return False
         self._fifo_path = fifo_path
 
-        # Start ffmpeg FIRST with the FIFO PATH as input.  libav opens the read
-        # side natively (blocking O_RDONLY) in ffmpeg's own process and probes
-        # the MOV container.  Our process is never blocked by this open().
-        try:
-            self._ffmpeg = subprocess.Popen(
-                [
-                    _FFMPEG_EXE,
-                    "-loglevel", "error",
-                    "-f", "mov",
-                    "-fflags", "+nobuffer+discardcorrupt+igndts",
-                    "-flags", "+low_delay",
-                    "-probesize", "5000000",
-                    "-analyzeduration", "5000000",
-                    "-i", fifo_path,
-                    "-c:v", "copy",
-                    "-an",
-                    "-movflags", "+frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
-                    "-frag_duration", str(_FRAG_DURATION_US),
-                    "-f", "mp4",
-                    "pipe:1",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,
-            )
-        except Exception as e:
-            logger.error(f"H264StreamService: ffmpeg launch failed for {self.udid}: {e}")
-            self._cleanup_processes()
-            return False
+        self._running = True
+
+        # Start the PyAV reader thread FIRST.  It blocks in av.open() until
+        # simctl connects the FIFO write side, then remuxes packets into
+        # fragmented MP4 (see _reader_loop).
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
 
         # Start simctl recordVideo (writer).  --force overwrites a pre-existing
-        # path; its write-side open rendezvous with ffmpeg's read side.
+        # path; its write-side open rendezvous with the reader's av.open above.
         try:
             self._simctl = subprocess.Popen(
                 ["xcrun", "simctl", "io", self.udid,
@@ -170,27 +155,17 @@ class H264StreamService:
             )
         except Exception as e:
             logger.error(f"H264StreamService: simctl launch failed for {self.udid}: {e}")
-            self._cleanup_processes()
+            self.stop()
             return False
 
-        self._running = True
-
-        # Start reader and stderr-drain threads
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._reader_thread.start()
         threading.Thread(
             target=self._drain_stderr,
             args=(self._simctl.stderr, "simctl"),
             daemon=True,
         ).start()
-        threading.Thread(
-            target=self._drain_stderr,
-            args=(self._ffmpeg.stderr, "ffmpeg"),
-            daemon=True,
-        ).start()
 
         # Wait for the init segment so the first client gets it immediately.
-        # Poll periodically to detect early process exit and fail fast.
+        # Poll periodically to detect early process/reader exit and fail fast.
         deadline = time.monotonic() + self.START_TIMEOUT
         while not self._init_ready.is_set():
             if self._init_ready.wait(timeout=1.0):
@@ -198,16 +173,16 @@ class H264StreamService:
             if time.monotonic() >= deadline:
                 logger.warning(
                     f"H264StreamService: init segment timeout for {self.udid} "
-                    f"(simctl_exit={self._simctl.poll()}, ffmpeg_exit={self._ffmpeg.poll()})"
+                    f"(simctl_exit={self._simctl.poll()})"
                 )
                 self.stop()
                 return False
             simctl_rc = self._simctl.poll()
-            ffmpeg_rc = self._ffmpeg.poll()
-            if simctl_rc is not None or ffmpeg_rc is not None:
+            reader_alive = self._reader_thread.is_alive()
+            if simctl_rc is not None or not reader_alive:
                 logger.error(
                     f"H264StreamService: process exited early for {self.udid} "
-                    f"(simctl_exit={simctl_rc}, ffmpeg_exit={ffmpeg_rc})"
+                    f"(simctl_exit={simctl_rc}, reader_alive={reader_alive})"
                 )
                 self.stop()
                 return False
@@ -240,18 +215,20 @@ class H264StreamService:
                 except Exception: pass
             self._simctl = None
 
-        if self._ffmpeg:
+        # Closing the input container unblocks the reader thread's demux loop.
+        if self._out_container is not None:
             try:
-                if self._ffmpeg.poll() is None:
-                    self._ffmpeg.terminate()
-                    try:
-                        self._ffmpeg.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        self._ffmpeg.kill()
-                        self._ffmpeg.wait(timeout=2)
+                self._out_container.close()
             except Exception:
                 pass
-            self._ffmpeg = None
+            self._out_container = None
+
+        if self._in_container is not None:
+            try:
+                self._in_container.close()
+            except Exception:
+                pass
+            self._in_container = None
 
         if self._fifo_path:
             try:
@@ -274,75 +251,105 @@ class H264StreamService:
             pass
 
     def _reader_loop(self) -> None:
-        """Parse top-level MP4 boxes from ffmpeg stdout and broadcast."""
+        """Demux the simctl MOV (FIFO) with PyAV and remux to fragmented MP4.
+
+        av.open(fifo_path) blocks on the FIFO read-side open until simctl
+        connects the write side, then probes the MOV container — exactly the
+        proven IdbStreamService path.  Packets are bitstream-copied (no
+        transcode) into a fragmented MP4 muxer whose output is captured by
+        ``_Fmp4Writer`` and parsed into MSE init/media segments.
+        """
         try:
-            assert self._ffmpeg and self._ffmpeg.stdout
-            stdout = self._ffmpeg.stdout
+            self._in_container = av.open(
+                self._fifo_path,
+                mode="r",
+                format="mov",
+                options={
+                    "fflags": "+nobuffer+discardcorrupt+igndts",
+                    "flags": "+low_delay",
+                    "probesize": "5000000",
+                    "analyzeduration": "5000000",
+                },
+            )
+            in_stream = self._in_container.streams.video[0]
 
-            buffer = b""
-            init_accumulator = b""
-            init_collected = False
-            # Accumulate a media segment as moof + mdat so MSE gets a complete
-            # fragment in a single appendBuffer call.
-            media_accumulator = b""
+            self._out_container = av.open(
+                _Fmp4Writer(self),
+                mode="w",
+                format="mp4",
+                options={
+                    "movflags": "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
+                    "frag_duration": str(_FRAG_DURATION_US),
+                },
+            )
+            out_stream = self._out_container.add_stream(template=in_stream)
 
-            while self._running:
-                chunk = stdout.read(_READ_CHUNK)
-                if not chunk:
+            for packet in self._in_container.demux(in_stream):
+                if not self._running:
                     break
-                buffer += chunk
-
-                while len(buffer) >= 8:
-                    size = int.from_bytes(buffer[:4], "big")
-                    box_type = buffer[4:8].decode("ascii", errors="replace")
-
-                    # size==1 means 64-bit large size follows; size==0 means
-                    # extends to EOF.  Neither occurs in fragmented MP4
-                    # produced by ffmpeg with these flags, but guard anyway.
-                    if size < 8 or size > 64 * 1024 * 1024:
-                        logger.warning(
-                            f"H264Stream[{self.udid}]: invalid box size {size} "
-                            f"({box_type!r}); resyncing"
-                        )
-                        buffer = b""
-                        break
-                    if size > len(buffer):
-                        break  # need more data
-
-                    box_data = buffer[:size]
-                    buffer = buffer[size:]
-
-                    if not init_collected:
-                        init_accumulator += box_data
-                        if box_type == "moov":
-                            with self._lock:
-                                self._init_segment = init_accumulator
-                            init_collected = True
-                            init_accumulator = b""
-                            self._init_ready.set()
-                    else:
-                        # Pair each moof with its following mdat before sending
-                        if box_type == "moof":
-                            # Flush any orphaned mdat-less leftover (shouldn't
-                            # happen but be defensive)
-                            if media_accumulator:
-                                self._broadcast(media_accumulator)
-                            media_accumulator = box_data
-                        elif box_type == "mdat":
-                            media_accumulator += box_data
-                            self._broadcast(media_accumulator)
-                            media_accumulator = b""
-                        else:
-                            # styp / sidx / etc.  Pass through standalone.
-                            if media_accumulator:
-                                # Prepend to the next pair (e.g. styp before moof)
-                                media_accumulator = box_data + media_accumulator
-                            else:
-                                self._broadcast(box_data)
+                if packet.dts is None:
+                    continue  # flush/incomplete packet
+                packet.stream = out_stream
+                self._out_container.mux(packet)
         except Exception as e:
             logger.error(f"H264StreamService reader error for {self.udid}: {e}")
         finally:
             logger.info(f"H264StreamService reader exited for {self.udid}")
+
+    def _feed_bytes(self, chunk: bytes) -> None:
+        """Parse fragmented-MP4 bytes emitted by the muxer into MSE segments.
+
+        Called from the muxer's write callback (reader thread).  Caches the
+        init segment (ftyp..moov) and broadcasts each moof+mdat media segment.
+        """
+        if not chunk:
+            return
+        self._parse_buffer += chunk
+
+        while len(self._parse_buffer) >= 8:
+            size = int.from_bytes(self._parse_buffer[:4], "big")
+            box_type = self._parse_buffer[4:8].decode("ascii", errors="replace")
+
+            # size==1 (64-bit) / size==0 (to EOF) do not occur in fragmented
+            # MP4 with these flags, but guard against corruption anyway.
+            if size < 8 or size > 64 * 1024 * 1024:
+                logger.warning(
+                    f"H264Stream[{self.udid}]: invalid box size {size} "
+                    f"({box_type!r}); resyncing"
+                )
+                self._parse_buffer = b""
+                return
+            if size > len(self._parse_buffer):
+                return  # need more data
+
+            box_data = self._parse_buffer[:size]
+            self._parse_buffer = self._parse_buffer[size:]
+
+            if not self._init_collected:
+                self._init_accumulator += box_data
+                if box_type == "moov":
+                    with self._lock:
+                        self._init_segment = self._init_accumulator
+                    self._init_collected = True
+                    self._init_accumulator = b""
+                    self._init_ready.set()
+            else:
+                # Pair each moof with its following mdat so MSE gets a complete
+                # fragment in a single appendBuffer call.
+                if box_type == "moof":
+                    if self._media_accumulator:
+                        self._broadcast(self._media_accumulator)
+                    self._media_accumulator = box_data
+                elif box_type == "mdat":
+                    self._media_accumulator += box_data
+                    self._broadcast(self._media_accumulator)
+                    self._media_accumulator = b""
+                else:
+                    # styp / sidx / etc.  Prepend to the next pair or pass through.
+                    if self._media_accumulator:
+                        self._media_accumulator = box_data + self._media_accumulator
+                    else:
+                        self._broadcast(box_data)
 
     def _broadcast(self, data: bytes) -> None:
         if not self._loop or not data:
@@ -386,7 +393,7 @@ class H264StreamService:
 
     @property
     def is_running(self) -> bool:
-        return self._running and (self._ffmpeg is not None and self._ffmpeg.poll() is None)
+        return self._running and (self._simctl is not None and self._simctl.poll() is None)
 
 
 # ----------------------------------------------------------------------
