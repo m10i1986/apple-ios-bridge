@@ -1,17 +1,24 @@
 """H.264 fragmented MP4 broadcaster for iOS simulators.
 
 Pipeline:
-    xcrun simctl io <udid> recordVideo --codec=h264 --force <output.mov>
-        -> (regular file written by simctl with H.264 in MOV container)
-    relay thread: tail-follows the file and writes chunks to an anonymous pipe
+    xcrun simctl io <udid> recordVideo --codec=h264 <fifo>
+        -> simctl detects the output is a non-seekable FIFO and uses
+           AVAssetWriter in streaming mode, writing MOV data continuously.
     ffmpeg -i pipe:{r_fd} -c copy -movflags +frag_keyframe+empty_moov+default_base_moof
            -f mp4 pipe:1
         -> (fragmented MP4 on stdout; remux only, no transcode)
 
-Note: simctl recordVideo --force always unlinks any existing path and creates
-a regular file (mode 0o100644), even if a FIFO was placed there.  Therefore
-a named FIFO cannot be used as the simctl output.  Instead we let simctl write
-to a temp .mov file and relay its contents via an anonymous pipe to ffmpeg.
+Key design decisions:
+  - UUID-based FIFO path: guaranteed unique per run; never pre-exists so
+    simctl does NOT need --force and does NOT unlink/replace the FIFO.
+    (simctl --force always replaces the output with a regular file, breaking
+    streaming because AVAssetWriter then uses seekable file I/O and buffers
+    everything until stop.)
+  - Keepalive write-end: opened O_WRONLY|O_NONBLOCK right after the read-end
+    so that ffmpeg's reads block (waiting for real data) rather than returning
+    EOF immediately when no writer is present yet.
+  - fd-based ffmpeg input (pipe:{r_fd} + pass_fds): no path-based open() in
+    ffmpeg, so there is no blocking open() race.
 
 The reader thread parses top-level MP4 boxes:
     - Init segment: ftyp + moov  (cached, re-sent to each new client)
@@ -22,12 +29,14 @@ This module is fully additive and does not modify existing capture paths
 """
 
 import asyncio
+import fcntl
 import os
 import shutil
 import signal
 import subprocess
 import threading
 import time
+import uuid
 from typing import Dict, Optional, Set
 
 from app.core.logging import logger
@@ -74,9 +83,8 @@ class H264StreamService:
 
         self._simctl: Optional[subprocess.Popen] = None
         self._ffmpeg: Optional[subprocess.Popen] = None
-        self._output_path: Optional[str] = None   # regular file simctl writes to
-        self._relay_thread: Optional[threading.Thread] = None
-        self._relay_w_fd: Optional[int] = None    # write-end of relay pipe
+        self._fifo_path: Optional[str] = None
+        self._keepalive_w_fd: Optional[int] = None  # write-end keepalive on FIFO
         self._reader_thread: Optional[threading.Thread] = None
         self._running = False
 
@@ -115,31 +123,48 @@ class H264StreamService:
         except Exception:
             pass
 
-        # simctl recordVideo --force always unlinks any existing path and creates
-        # a regular file.  We let it write to a temp .mov file, then relay the
-        # file contents to ffmpeg via an anonymous pipe.
-        output_path = f"/tmp/ios_bridge_h264_{self.udid}_{os.getpid()}.mov"
+        # UUID-based FIFO path: guaranteed unique, never pre-exists.
+        # simctl does NOT need --force, so it will NOT unlink/replace the FIFO
+        # with a regular file.  When writing to a FIFO (non-seekable),
+        # AVAssetWriter operates in streaming mode and writes data continuously.
+        fifo_path = f"/tmp/ios_bridge_h264_{uuid.uuid4().hex}.pipe"
         try:
-            if os.path.exists(output_path):
-                os.unlink(output_path)
+            os.mkfifo(fifo_path, mode=0o600)
         except Exception as e:
-            logger.error(f"H264StreamService: output path cleanup failed for {self.udid}: {e}")
+            logger.error(f"H264StreamService: FIFO creation failed for {self.udid}: {e}")
             return False
-        self._output_path = output_path
+        self._fifo_path = fifo_path
 
-        # Anonymous pipe: relay thread writes, ffmpeg reads.
+        # Open read-end without blocking (O_NONBLOCK: succeeds even without a writer).
         try:
-            r_fd, w_fd = os.pipe()
+            r_fd = os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+            # Switch to blocking mode: reads will wait for data.
+            flags = fcntl.fcntl(r_fd, fcntl.F_GETFL)
+            fcntl.fcntl(r_fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
         except Exception as e:
-            logger.error(f"H264StreamService: pipe() failed for {self.udid}: {e}")
+            logger.error(f"H264StreamService: FIFO read-end open failed for {self.udid}: {e}")
+            self._cleanup_processes()
             return False
-        self._relay_w_fd = w_fd
 
-        # Start simctl writing to the regular file.
+        # Open keepalive write-end (O_NONBLOCK: succeeds since reader is present).
+        # POSIX: read() on a pipe/FIFO with NO writers returns 0 (EOF) immediately
+        # even in blocking mode.  The keepalive write-end prevents premature EOF
+        # until simctl opens its own write-end.
+        try:
+            keepalive_w_fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+        except Exception as e:
+            logger.error(f"H264StreamService: FIFO keepalive open failed for {self.udid}: {e}")
+            os.close(r_fd)
+            self._cleanup_processes()
+            return False
+        self._keepalive_w_fd = keepalive_w_fd
+
+        # Start simctl WITHOUT --force: the path is fresh (UUID), so no conflict.
+        # r_fd + keepalive_w_fd being open means simctl's O_WRONLY open won't block.
         try:
             self._simctl = subprocess.Popen(
                 ["xcrun", "simctl", "io", self.udid,
-                 "recordVideo", "--codec=h264", "--force", output_path],
+                 "recordVideo", "--codec=h264", fifo_path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
@@ -149,21 +174,12 @@ class H264StreamService:
             self._cleanup_processes()
             return False
 
-        # Start relay thread: tails output_path and forwards data to w_fd.
-        self._relay_thread = threading.Thread(
-            target=self._relay_loop, args=(output_path, w_fd), daemon=True
-        )
-        self._relay_thread.start()
-
-        # Start ffmpeg reading from r_fd via pass_fds (no path-based open()).
-        # Input format is explicitly 'mov' because simctl writes a MOV container;
-        # without -f mov ffmpeg may fail to detect the format on a non-seekable pipe.
+        # Start ffmpeg reading r_fd via pass_fds (no path-based open() call).
         try:
             self._ffmpeg = subprocess.Popen(
                 [
                     _FFMPEG_EXE,
                     "-loglevel", "error",
-                    "-f", "mov",
                     "-fflags", "+nobuffer+discardcorrupt+igndts",
                     "-flags", "+low_delay",
                     "-probesize", "5000000",
@@ -233,9 +249,6 @@ class H264StreamService:
     def stop(self) -> None:
         self._running = False
         self._cleanup_processes()
-        if self._relay_thread:
-            self._relay_thread.join(timeout=5)
-            self._relay_thread = None
         if self._reader_thread:
             self._reader_thread.join(timeout=3)
             self._reader_thread = None
@@ -271,75 +284,23 @@ class H264StreamService:
                 pass
             self._ffmpeg = None
 
-        if self._relay_w_fd is not None:
+        if self._keepalive_w_fd is not None:
             try:
-                os.close(self._relay_w_fd)
+                os.close(self._keepalive_w_fd)
             except Exception:
                 pass
-            self._relay_w_fd = None
+            self._keepalive_w_fd = None
 
-        if self._output_path:
+        if self._fifo_path:
             try:
-                os.unlink(self._output_path)
+                os.unlink(self._fifo_path)
             except Exception:
                 pass
-            self._output_path = None
+            self._fifo_path = None
 
     # ------------------------------------------------------------------
     # Reader / broadcaster
     # ------------------------------------------------------------------
-
-    def _relay_loop(self, output_path: str, w_fd: int) -> None:
-        """Tail-follow simctl output file and forward bytes to ffmpeg via pipe."""
-        total_relayed = 0
-        try:
-            # Wait for simctl to create the file (it may take a moment after Popen).
-            deadline = time.monotonic() + 8.0
-            while not os.path.exists(output_path):
-                if time.monotonic() > deadline:
-                    logger.error(
-                        f"H264StreamService: relay timed out waiting for "
-                        f"{output_path} to be created"
-                    )
-                    return
-                time.sleep(0.05)
-
-            logger.info(f"H264StreamService: relay file appeared for {self.udid}")
-            with open(output_path, "rb") as f:
-                while self._running:
-                    chunk = f.read(_READ_CHUNK)
-                    if chunk:
-                        try:
-                            os.write(w_fd, chunk)
-                            total_relayed += len(chunk)
-                        except OSError:
-                            break
-                    else:
-                        # Caught up to current write position.
-                        if self._simctl and self._simctl.poll() is not None:
-                            # simctl exited; drain any remaining bytes then stop.
-                            remaining = f.read()
-                            if remaining:
-                                try:
-                                    os.write(w_fd, remaining)
-                                except OSError:
-                                    pass
-                            break
-                        time.sleep(0.01)
-        except Exception as e:
-            logger.error(f"H264StreamService relay error for {self.udid}: {e}")
-        finally:
-            # Close write-end so ffmpeg gets a clean EOF.
-            try:
-                os.close(w_fd)
-            except Exception:
-                pass
-            if self._relay_w_fd == w_fd:
-                self._relay_w_fd = None
-            logger.info(
-                f"H264StreamService relay exited for {self.udid} "
-                f"(total_relayed={total_relayed} bytes)"
-            )
 
     def _drain_stderr(self, stream, name: str) -> None:
         try:
