@@ -280,6 +280,11 @@ class H264StreamService:
                 options={
                     "movflags": "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
                     "frag_duration": str(_FRAG_DURATION_US),
+                    # Force libav to flush its AVIO buffer to our write()
+                    # callback after every packet.  Without this the small
+                    # ftyp+moov init segment sits in the ~32KB output buffer
+                    # until it fills, so MSE clients never get the init in time.
+                    "flush_packets": "1",
                 },
             )
             out_stream = self._out_container.add_stream(template=in_stream)
