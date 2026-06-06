@@ -1,24 +1,20 @@
 """H.264 fragmented MP4 broadcaster for iOS simulators.
 
 Pipeline:
-    xcrun simctl io <udid> recordVideo --codec=h264 <fifo>
-        -> simctl detects the output is a non-seekable FIFO and uses
-           AVAssetWriter in streaming mode, writing MOV data continuously.
-    ffmpeg -i pipe:{r_fd} -c copy -movflags +frag_keyframe+empty_moov+default_base_moof
+    xcrun simctl io <udid> recordVideo --codec=h264 --force <fifo>
+        -> (FIFO, MOV container with H.264 elementary stream)
+    ffmpeg -f mov -i <fifo> -c copy -movflags +frag_keyframe+empty_moov+...
            -f mp4 pipe:1
         -> (fragmented MP4 on stdout; remux only, no transcode)
 
-Key design decisions:
-  - UUID-based FIFO path: guaranteed unique per run; never pre-exists so
-    simctl does NOT need --force and does NOT unlink/replace the FIFO.
-    (simctl --force always replaces the output with a regular file, breaking
-    streaming because AVAssetWriter then uses seekable file I/O and buffers
-    everything until stop.)
-  - Keepalive write-end: opened O_WRONLY|O_NONBLOCK right after the read-end
-    so that ffmpeg's reads block (waiting for real data) rather than returning
-    EOF immediately when no writer is present yet.
-  - fd-based ffmpeg input (pipe:{r_fd} + pass_fds): no path-based open() in
-    ffmpeg, so there is no blocking open() race.
+This mirrors the proven IdbStreamService recordVideo pattern:
+  1. Create a named FIFO.
+  2. Launch ffmpeg FIRST with the FIFO PATH as input.  ffmpeg's libav opens
+     the read side natively (blocking O_RDONLY) and probes the MOV container,
+     exactly as required for a non-seekable pipe.  Running ffmpeg in its own
+     process means our event loop is never blocked by the open().
+  3. Launch simctl recordVideo (writer); its write-side open rendezvous with
+     ffmpeg's read side.  Blocking opens rendezvous regardless of order.
 
 The reader thread parses top-level MP4 boxes:
     - Init segment: ftyp + moov  (cached, re-sent to each new client)
@@ -29,14 +25,12 @@ This module is fully additive and does not modify existing capture paths
 """
 
 import asyncio
-import fcntl
 import os
 import shutil
 import signal
 import subprocess
 import threading
 import time
-import uuid
 from typing import Dict, Optional, Set
 
 from app.core.logging import logger
@@ -76,7 +70,7 @@ _READ_CHUNK = 65536
 class H264StreamService:
     """Per-UDID fMP4 broadcaster.  Instances are managed by the WS handler."""
 
-    START_TIMEOUT: float = 20.0  # seconds to wait for the init (moov) segment
+    START_TIMEOUT: float = 10.0  # seconds to wait for the init (moov) segment
 
     def __init__(self, udid: str) -> None:
         self.udid = udid
@@ -84,7 +78,6 @@ class H264StreamService:
         self._simctl: Optional[subprocess.Popen] = None
         self._ffmpeg: Optional[subprocess.Popen] = None
         self._fifo_path: Optional[str] = None
-        self._keepalive_w_fd: Optional[int] = None  # write-end keepalive on FIFO
         self._reader_thread: Optional[threading.Thread] = None
         self._running = False
 
@@ -123,68 +116,33 @@ class H264StreamService:
         except Exception:
             pass
 
-        # UUID-based FIFO path: guaranteed unique, never pre-exists.
-        # simctl does NOT need --force, so it will NOT unlink/replace the FIFO
-        # with a regular file.  When writing to a FIFO (non-seekable),
-        # AVAssetWriter operates in streaming mode and writes data continuously.
-        fifo_path = f"/tmp/ios_bridge_h264_{uuid.uuid4().hex}.pipe"
+        # Create a named FIFO.  ffmpeg (started next) opens the read side by
+        # PATH, blocking until simctl connects the write side — the proven
+        # IdbStreamService pattern.
+        fifo_path = f"/tmp/ios_bridge_h264_{self.udid}_{os.getpid()}.pipe"
         try:
+            if os.path.exists(fifo_path):
+                os.unlink(fifo_path)
             os.mkfifo(fifo_path, mode=0o600)
         except Exception as e:
             logger.error(f"H264StreamService: FIFO creation failed for {self.udid}: {e}")
             return False
         self._fifo_path = fifo_path
 
-        # Open read-end without blocking (O_NONBLOCK: succeeds even without a writer).
-        try:
-            r_fd = os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
-            # Switch to blocking mode: reads will wait for data.
-            flags = fcntl.fcntl(r_fd, fcntl.F_GETFL)
-            fcntl.fcntl(r_fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
-        except Exception as e:
-            logger.error(f"H264StreamService: FIFO read-end open failed for {self.udid}: {e}")
-            self._cleanup_processes()
-            return False
-
-        # Open keepalive write-end (O_NONBLOCK: succeeds since reader is present).
-        # POSIX: read() on a pipe/FIFO with NO writers returns 0 (EOF) immediately
-        # even in blocking mode.  The keepalive write-end prevents premature EOF
-        # until simctl opens its own write-end.
-        try:
-            keepalive_w_fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
-        except Exception as e:
-            logger.error(f"H264StreamService: FIFO keepalive open failed for {self.udid}: {e}")
-            os.close(r_fd)
-            self._cleanup_processes()
-            return False
-        self._keepalive_w_fd = keepalive_w_fd
-
-        # Start simctl WITHOUT --force: the path is fresh (UUID), so no conflict.
-        # r_fd + keepalive_w_fd being open means simctl's O_WRONLY open won't block.
-        try:
-            self._simctl = subprocess.Popen(
-                ["xcrun", "simctl", "io", self.udid,
-                 "recordVideo", "--codec=h264", fifo_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-        except Exception as e:
-            logger.error(f"H264StreamService: simctl launch failed for {self.udid}: {e}")
-            os.close(r_fd)
-            self._cleanup_processes()
-            return False
-
-        # Start ffmpeg reading r_fd via pass_fds (no path-based open() call).
+        # Start ffmpeg FIRST with the FIFO PATH as input.  libav opens the read
+        # side natively (blocking O_RDONLY) in ffmpeg's own process and probes
+        # the MOV container.  Our process is never blocked by this open().
         try:
             self._ffmpeg = subprocess.Popen(
                 [
                     _FFMPEG_EXE,
                     "-loglevel", "error",
+                    "-f", "mov",
                     "-fflags", "+nobuffer+discardcorrupt+igndts",
                     "-flags", "+low_delay",
                     "-probesize", "5000000",
                     "-analyzeduration", "5000000",
-                    "-i", f"pipe:{r_fd}",
+                    "-i", fifo_path,
                     "-c:v", "copy",
                     "-an",
                     "-movflags", "+frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
@@ -192,17 +150,28 @@ class H264StreamService:
                     "-f", "mp4",
                     "pipe:1",
                 ],
-                pass_fds=(r_fd,),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
             )
         except Exception as e:
             logger.error(f"H264StreamService: ffmpeg launch failed for {self.udid}: {e}")
-            os.close(r_fd)
             self._cleanup_processes()
             return False
-        os.close(r_fd)  # parent no longer needs read-end; ffmpeg has its dup
+
+        # Start simctl recordVideo (writer).  --force overwrites a pre-existing
+        # path; its write-side open rendezvous with ffmpeg's read side.
+        try:
+            self._simctl = subprocess.Popen(
+                ["xcrun", "simctl", "io", self.udid,
+                 "recordVideo", "--codec=h264", "--force", fifo_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except Exception as e:
+            logger.error(f"H264StreamService: simctl launch failed for {self.udid}: {e}")
+            self._cleanup_processes()
+            return False
 
         self._running = True
 
@@ -283,13 +252,6 @@ class H264StreamService:
             except Exception:
                 pass
             self._ffmpeg = None
-
-        if self._keepalive_w_fd is not None:
-            try:
-                os.close(self._keepalive_w_fd)
-            except Exception:
-                pass
-            self._keepalive_w_fd = None
 
         if self._fifo_path:
             try:
