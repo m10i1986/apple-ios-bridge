@@ -46,9 +46,9 @@ class Settings:
 
     # Timeouts
     SCREENSHOT_TIMEOUT: float = 0.5
-    TAP_TIMEOUT: float = 2.0
-    SWIPE_TIMEOUT: float = 3.0
-    TEXT_TIMEOUT: float = 5.0
+    TAP_TIMEOUT: float = 5.0
+    SWIPE_TIMEOUT: float = 5.0
+    TEXT_TIMEOUT: float = 10.0
 
     # Server Configuration
     HOST: str = "0.0.0.0"
