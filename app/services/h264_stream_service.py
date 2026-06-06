@@ -141,12 +141,14 @@ class H264StreamService:
             self._cleanup_processes()
             return False
 
-        # Start simctl — no --force needed since stale processes were killed.
+        # Start simctl with --force so it skips the "file already exists" check.
         # r_fd being open means simctl's open(fifo_path, O_WRONLY) won't block.
+        # If --force causes simctl to unlink+recreate the FIFO as a regular file,
+        # ffmpeg still reads from the original inode via r_fd (pass_fds).
         try:
             self._simctl = subprocess.Popen(
                 ["xcrun", "simctl", "io", self.udid,
-                 "recordVideo", "--codec=h264", fifo_path],
+                 "recordVideo", "--codec=h264", "--force", fifo_path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
