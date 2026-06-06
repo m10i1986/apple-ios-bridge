@@ -21,6 +21,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import time
 from typing import Dict, Optional, Set
 
 from app.core.logging import logger
@@ -60,7 +61,7 @@ _READ_CHUNK = 65536
 class H264StreamService:
     """Per-UDID fMP4 broadcaster.  Instances are managed by the WS handler."""
 
-    START_TIMEOUT: float = 8.0  # seconds to wait for the init (moov) segment
+    START_TIMEOUT: float = 30.0  # seconds to wait for the init (moov) segment
 
     def __init__(self, udid: str) -> None:
         self.udid = udid
@@ -107,8 +108,8 @@ class H264StreamService:
                     "-loglevel", "error",
                     "-fflags", "+nobuffer+discardcorrupt+igndts",
                     "-flags", "+low_delay",
-                    "-probesize", "5000000",
-                    "-analyzeduration", "5000000",
+                    "-probesize", "1000000",
+                    "-analyzeduration", "1000000",
                     "-i", fifo_path,
                     "-c:v", "copy",
                     "-an",
@@ -156,13 +157,27 @@ class H264StreamService:
         ).start()
 
         # Wait for the init segment so the first client gets it immediately.
-        if not self._init_ready.wait(timeout=self.START_TIMEOUT):
-            logger.warning(
-                f"H264StreamService: init segment timeout for {self.udid} "
-                f"(simctl_exit={self._simctl.poll()}, ffmpeg_exit={self._ffmpeg.poll()})"
-            )
-            self.stop()
-            return False
+        # Poll periodically to detect early process exit and fail fast.
+        deadline = time.monotonic() + self.START_TIMEOUT
+        while not self._init_ready.is_set():
+            if self._init_ready.wait(timeout=1.0):
+                break
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    f"H264StreamService: init segment timeout for {self.udid} "
+                    f"(simctl_exit={self._simctl.poll()}, ffmpeg_exit={self._ffmpeg.poll()})"
+                )
+                self.stop()
+                return False
+            simctl_rc = self._simctl.poll()
+            ffmpeg_rc = self._ffmpeg.poll()
+            if simctl_rc is not None or ffmpeg_rc is not None:
+                logger.error(
+                    f"H264StreamService: process exited early for {self.udid} "
+                    f"(simctl_exit={simctl_rc}, ffmpeg_exit={ffmpeg_rc})"
+                )
+                self.stop()
+                return False
 
         logger.info(f"✅ H264StreamService started for {self.udid}")
         return True
@@ -347,22 +362,33 @@ _registry_lock = threading.Lock()
 _registry: Dict[str, H264StreamService] = {}
 
 
-def get_or_start_service(udid: str, loop: asyncio.AbstractEventLoop) -> Optional[H264StreamService]:
-    """Return a running service for the UDID, creating one if needed."""
-    with _registry_lock:
-        svc = _registry.get(udid)
-        if svc is not None and svc.is_running:
+def get_or_start_service(udid: str, loop: asyncio.AbstractEventLoop, max_retries: int = 2) -> Optional[H264StreamService]:
+    """Return a running service for the UDID, creating one if needed.
+
+    Retries up to *max_retries* times on start failure (e.g. simctl warm-up
+    delay causing the init-segment timeout to fire on the first attempt).
+    """
+    for attempt in range(max_retries + 1):
+        with _registry_lock:
+            svc = _registry.get(udid)
+            if svc is not None and svc.is_running:
+                return svc
+            if svc is not None:
+                # Stale entry; clean up before recreating.
+                svc.stop()
+                _registry.pop(udid, None)
+            svc = H264StreamService(udid)
+        if svc.start(loop):
+            with _registry_lock:
+                _registry[udid] = svc
             return svc
-        if svc is not None:
-            # Stale entry; clean up before recreating.
-            svc.stop()
-            _registry.pop(udid, None)
-        svc = H264StreamService(udid)
-    if not svc.start(loop):
-        return None
-    with _registry_lock:
-        _registry[udid] = svc
-    return svc
+        if attempt < max_retries:
+            logger.info(
+                f"H264StreamService: retrying start for {udid} "
+                f"(attempt {attempt + 1}/{max_retries})"
+            )
+            time.sleep(2.0)
+    return None
 
 
 def release_service_if_idle(udid: str) -> None:
