@@ -17,12 +17,35 @@ This module is fully additive and does not modify existing capture paths
 
 import asyncio
 import os
+import shutil
 import signal
 import subprocess
 import threading
 from typing import Dict, Optional, Set
 
 from app.core.logging import logger
+
+
+def _resolve_ffmpeg() -> str:
+    """Return the ffmpeg executable path.
+
+    Preference order:
+    1. System PATH (``which ffmpeg``)
+    2. imageio-ffmpeg bundled binary
+    3. Bare ``'ffmpeg'`` (raises clear error at runtime if missing)
+    """
+    system = shutil.which("ffmpeg")
+    if system:
+        return system
+    try:
+        import imageio_ffmpeg  # type: ignore[import]
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+    return "ffmpeg"
+
+
+_FFMPEG_EXE = _resolve_ffmpeg()
 
 
 # Default MSE codec hint sent to clients.  simctl recordVideo --codec=h264
@@ -80,7 +103,7 @@ class H264StreamService:
         try:
             self._ffmpeg = subprocess.Popen(
                 [
-                    "ffmpeg",
+                    _FFMPEG_EXE,
                     "-loglevel", "error",
                     "-fflags", "+nobuffer+discardcorrupt+igndts",
                     "-flags", "+low_delay",
