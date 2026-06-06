@@ -12,6 +12,7 @@ versions, not stdout, so the screenshot stdout variant is not used.
 import base64
 import io
 import os
+import signal
 import subprocess
 import tempfile
 import threading
@@ -144,11 +145,13 @@ class IdbStreamService:
             return False
 
         # Drain stderr so the pipe does not block recordVideo.
+        # Logged at INFO so recordVideo failures (proc_exit != 0) are visible.
         def _drain_stderr():
             try:
                 for line in proc.stderr:
                     text = line.decode(errors="replace").strip()
-                    logger.debug(f"simctl recordVideo: {text}")
+                    if text:
+                        logger.info(f"simctl recordVideo[{self.udid}]: {text}")
             except Exception:
                 pass
 
@@ -270,11 +273,20 @@ class IdbStreamService:
 
         if self._process:
             try:
-                self._process.terminate()
-                self._process.wait(timeout=3)
+                # simctl recordVideo must be stopped with SIGINT so it can
+                # finalize the movie AND release the host recording lock.
+                # SIGTERM/kill leaves the lock held, causing the next start to
+                # fail with NSPOSIXErrorDomain Code=16 "Host recording is
+                # already in progress".
+                self._process.send_signal(signal.SIGINT)
+                self._process.wait(timeout=5)
             except Exception:
-                try: self._process.kill()
-                except Exception: pass
+                try:
+                    self._process.terminate()
+                    self._process.wait(timeout=3)
+                except Exception:
+                    try: self._process.kill()
+                    except Exception: pass
             self._process = None
 
         if self._fifo_path:
