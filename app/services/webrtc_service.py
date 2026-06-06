@@ -10,6 +10,7 @@ import av
 import numpy as np
 from PIL import Image
 from fractions import Fraction
+from aiortc.sdp import candidate_from_sdp
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, RTCIceCandidate
 
 from app.core.logging import logger
@@ -306,12 +307,20 @@ class SimpleWebRTCService:
         logger.debug(f"🧊 Handling ICE candidate for {self.udid}")
         candidate_info = candidate_data.get("candidate")
         if candidate_info:
-            candidate = RTCIceCandidate(
-                candidate=candidate_info.get("candidate"),
-                sdpMid=candidate_info.get("sdpMid"),
-                sdpMLineIndex=candidate_info.get("sdpMLineIndex")
-            )
-            await pc.addIceCandidate(candidate)
+            candidate_str = candidate_info.get("candidate", "")
+            if not candidate_str:
+                return
+            # aiortc 1.x: RTCIceCandidate does not accept a raw SDP string.
+            # Use candidate_from_sdp() to parse the SDP candidate line.
+            if candidate_str.startswith("candidate:"):
+                candidate_str = candidate_str[len("candidate:"):]
+            try:
+                candidate = candidate_from_sdp(candidate_str)
+                candidate.sdpMid = candidate_info.get("sdpMid")
+                candidate.sdpMLineIndex = candidate_info.get("sdpMLineIndex")
+                await pc.addIceCandidate(candidate)
+            except Exception as e:
+                logger.debug(f"🧊 ICE candidate parse error: {e}")
 
     def remove_connection(self, connection_id: str):
         """Remove connection and cleanup if no more connections"""
