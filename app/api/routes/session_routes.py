@@ -1129,48 +1129,56 @@ async def clear_logs(session_id: str):
 async def get_log_processes(session_id: str):
     """Get list of processes that are generating logs"""
     try:
-        if not session_manager.get_session(session_id):
-            raise HTTPException(status_code=404, detail="Session not found")
-        
         session = session_manager.get_session(session_id)
-        
-        # Get process list
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # Get process list running inside the simulator
         command = [
             'xcrun', 'simctl', 'spawn', session.udid,
             'ps', 'aux'
         ]
-        
+
         success, output = session_manager.ios_manager._run_command(command)
-        
+
         if success:
             processes = []
-            lines = output.split('\n')[1:]  # Skip header
-            
+            lines = output.split('\n')[1:]  # Skip header line
+
             for line in lines:
-                if line.strip():
-                    parts = line.split()
-                    if len(parts) >= 11:  # Standard ps output format
-                        processes.append({
-                            "pid": parts[1],
-                            "process": parts[10],
-                            "cpu": parts[2],
-                            "memory": parts[3]
-                        })
-            
+                if not line.strip():
+                    continue
+                parts = line.split()
+                if len(parts) >= 11:
+                    processes.append({
+                        "pid": parts[1],
+                        "cpu": parts[2],
+                        "memory": parts[3],
+                        "process": ' '.join(parts[10:]),  # command may contain spaces
+                    })
+                elif len(parts) >= 2:
+                    processes.append({
+                        "pid": parts[1] if len(parts) > 1 else "",
+                        "cpu": parts[2] if len(parts) > 2 else "",
+                        "memory": parts[3] if len(parts) > 3 else "",
+                        "process": parts[-1],
+                    })
+
             return {
                 "success": True,
                 "processes": processes
             }
         else:
+            # Command failed -- likely simulator not booted or xcrun unavailable
             raise HTTPException(
-                status_code=500,
-                detail=f"Failed to get processes: {output}"
+                status_code=503,
+                detail=f"Could not retrieve process list: {output}"
             )
-            
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting processes: {e}")
+        logger.error(f"Error getting processes for session {session_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 def _parse_log_line(line: str) -> dict:
