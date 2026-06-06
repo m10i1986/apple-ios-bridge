@@ -22,6 +22,7 @@ from app.api.websockets.webrtc_ws import WebRTCWebSocket
 from app.services.fast_webrtc_service import FastWebRTCService
 from app.services.connection_manager import connection_manager, managed_connection
 from app.services.resource_manager import resource_manager
+from app.core.auth import DigestAuthMiddleware
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -31,27 +32,30 @@ async def lifespan(app: FastAPI):
         # Trigger orphaned simulator recovery on startup
         logger.info("Performing orphaned simulator recovery...")
         session_manager._recover_orphaned_simulators()
-        
+
         # Start background tasks for connection and resource management
         connection_manager.start_background_tasks()
         resource_manager.start_background_tasks()
-        
+
         logger.info("Startup complete")
     except Exception as e:
         logger.error(f"Error during startup: {e}")
-    
+
     yield
-    
+
     # Shutdown
     logger.info("Application shutting down...")
-    
+
     # Stop background tasks
     await connection_manager.stop_background_tasks()
     await resource_manager.cleanup_all_services()
-    
+
     cleanup()
 
 app = FastAPI(title="iOS Remote Control", version="1.0.0", lifespan=lifespan)
+
+# Digest 認証ミドルウェア（WebSocket パスを除くすべての HTTP エンドポイントに適用）
+app.add_middleware(DigestAuthMiddleware, realm=settings.AUTH_REALM)
 
 # Templates
 templates = Jinja2Templates(directory="templates")
@@ -89,21 +93,21 @@ async def video_websocket(websocket: WebSocket, session_id: str):
             await websocket.accept()
             await websocket.close(code=4004, reason="Session not found")
             return
-        
+
         await websocket.accept()
-        
+
         # Use managed connection with rate limiting and tracking
         client_ip = getattr(websocket.client, 'host', None) if websocket.client else None
         async with managed_connection(session_id, "video_websocket", websocket, client_ip):
             # Get managed video service from resource manager
             video_service = await resource_manager.get_video_service(udid, f"video_ws_{session_id}")
             device_service = DeviceService(udid)
-            
+
             video_ws = VideoWebSocket(video_service, device_service)
-            
+
             # Handle the connection
             await video_ws.handle_connection_managed(websocket)
-            
+
     except WebSocketDisconnect:
         logger.info(f"Video WebSocket disconnected for session: {session_id}")
     except Exception as e:
@@ -123,19 +127,19 @@ async def webrtc_websocket(websocket: WebSocket, session_id: str):
             await websocket.accept()
             await websocket.close(code=4004, reason="Session not found")
             return
-        
+
         await websocket.accept()
-        
+
         # Use managed connection with rate limiting and tracking
         client_ip = getattr(websocket.client, 'host', None) if websocket.client else None
         async with managed_connection(session_id, "webrtc_websocket", websocket, client_ip):
             # Get managed WebRTC service from resource manager
             webrtc_service = await resource_manager.get_webrtc_service(udid, f"webrtc_ws_{session_id}")
             webrtc_ws = WebRTCWebSocket(webrtc_service)
-            
+
             # Handle the connection
             await webrtc_ws.handle_connection(websocket)
-            
+
     except WebSocketDisconnect:
         logger.info(f"WebRTC WebSocket disconnected for session: {session_id}")
     except Exception as e:
@@ -155,15 +159,15 @@ async def screenshot_websocket(websocket: WebSocket, session_id: str):
             await websocket.accept()
             await websocket.close(code=4004, reason="Session not found")
             return
-        
+
         # Create services for this session
         device_service = DeviceService(udid)
         screenshot_service = ScreenshotService(udid)
         screenshot_ws = ScreenshotWebSocket(device_service, screenshot_service)
-        
+
         # Handle the connection (only call this once!)
         await screenshot_ws.handle_connection(websocket)
-        
+
     except WebSocketDisconnect:
         logger.info(f"Screenshot WebSocket disconnected for session: {session_id}")
     except Exception as e:
@@ -199,7 +203,7 @@ async def control_page(request: Request, session_id: str):
     session_info = session_manager.get_session_info(session_id)
     if not session_info:
         return HTMLResponse("Session not found", status_code=404)
-    
+
     return templates.TemplateResponse("control.html", {
         "request": request,
         "session_id": session_id,
@@ -213,11 +217,11 @@ async def get_status(session_id: str):
         session_info = session_manager.get_session_info(session_id)
         if not session_info:
             return {"error": "Session not found", "status_code": 404}
-        
+
         udid = session_manager.get_session_udid(session_id)
         device_service = DeviceService(udid) if udid else None
         simulator_accessible = await device_service.is_accessible() if device_service else False
-        
+
         return {
             "session_id": session_id,
             "udid": udid,
@@ -236,7 +240,7 @@ async def set_webrtc_quality(session_id: str, quality: str):
         udid = session_manager.get_session_udid(session_id)
         if not udid:
             return {"success": False, "error": "Session not found"}
-        
+
         # Fast WebRTC presets (optimized screenshots with good latency)
         presets = {
             "low": {"fps": 45, "resolution": "234x507", "quality": "good"},
@@ -244,17 +248,17 @@ async def set_webrtc_quality(session_id: str, quality: str):
             "high": {"fps": 75, "resolution": "390x844", "quality": "high"},
             "ultra": {"fps": 90, "resolution": "468x1014", "quality": "best"}
         }
-        
+
         if quality in presets:
             return {
-                "success": True, 
+                "success": True,
                 "session_id": session_id,
-                "quality": quality, 
+                "quality": quality,
                 "settings": presets[quality]
             }
         else:
             return {"success": False, "error": "Invalid quality preset"}
-            
+
     except Exception as e:
         logger.error(f"Error setting WebRTC quality for session {session_id}: {e}")
         return {"success": False, "error": str(e)}
@@ -280,7 +284,7 @@ async def health_check():
     """Health check endpoint with resource manager stats"""
     connection_stats = connection_manager.get_connection_stats()
     resource_stats = resource_manager.get_service_stats()
-    
+
     return {
         "status": "healthy",
         "service": "iOS Remote Control",
@@ -296,7 +300,7 @@ async def get_management_stats():
     try:
         connection_stats = connection_manager.get_connection_stats()
         resource_stats = resource_manager.get_service_stats()
-        
+
         return {
             "success": True,
             "timestamp": time.time(),
@@ -317,7 +321,7 @@ def cleanup():
         logger.info("All recordings cleaned up successfully")
     except Exception as e:
         logger.error(f"Error during recording cleanup: {e}")
-    
+
     try:
         # Log final stats before shutdown
         connection_stats = connection_manager.get_connection_stats()
