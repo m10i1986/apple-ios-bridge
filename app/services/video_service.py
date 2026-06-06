@@ -189,8 +189,15 @@ class VideoService:
         while self.video_streaming_active:
             try:
                 stream = self.idb_stream
-                if stream is None or not stream.is_running:
-                    logger.warning(f"IdbStream stopped for {self.udid}, falling back")
+                if stream is None:
+                    break
+
+                # フレームが届かないままタイムアウト、またはプロセス終了 → フォールバック
+                if not stream.is_running or stream.first_frame_timed_out:
+                    logger.warning(
+                        f"IdbStream {'timed out' if stream.first_frame_timed_out else 'stopped'} "
+                        f"for {self.udid}, falling back to screenshots"
+                    )
                     break
 
                 frame_data = stream.get_latest_frame_b64()
@@ -212,8 +219,11 @@ class VideoService:
                 logger.error(f"idb stream processing error for {self.udid}: {e}")
                 break
 
-        # IdbStream died – fall through to screenshot mode
-        if self.video_streaming_active and self.idb_stream:
+        # IdbStream 終了 / タイムアウト → スクリーンショットモードにフォールバック
+        if self.idb_stream:
+            self.idb_stream.stop()
+            self.idb_stream = None
+        if self.video_streaming_active:
             logger.info(f"Falling back to screenshot mode for {self.udid}")
             self._ultra_high_fps_screenshots()
 

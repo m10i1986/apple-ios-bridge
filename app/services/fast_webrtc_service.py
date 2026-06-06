@@ -171,7 +171,7 @@ class FastWebRTCService:
                 try:
                     av_frame = None
 
-                    if use_idb and idb_stream and idb_stream.is_running:
+                    if use_idb and idb_stream and idb_stream.is_running and not idb_stream.first_frame_timed_out:
                         # --- Fast path: IdbStreamService (no fork) ---
                         if idb_stream.frame_count != last_idb_frame_count:
                             result = idb_stream.get_latest_frame_ndarray()
@@ -204,8 +204,11 @@ class FastWebRTCService:
                                 av_frame = av.VideoFrame.from_ndarray(img_array, format='rgb24')
                     else:
                         # --- Fallback: ScreenshotService ---
-                        if use_idb and idb_stream and not idb_stream.is_running:
-                            logger.warning(f"idb stream died for {self.udid}, switching to ScreenshotService")
+                        if use_idb and idb_stream and (not idb_stream.is_running or idb_stream.first_frame_timed_out):
+                            reason = "timed out" if idb_stream.first_frame_timed_out else "stopped"
+                            logger.warning(f"idb stream {reason} for {self.udid}, switching to ScreenshotService")
+                            idb_stream.stop()
+                            idb_stream = None
                             use_idb = False
                             screenshot_service = ScreenshotService(self.udid)
 

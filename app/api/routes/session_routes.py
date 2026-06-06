@@ -1133,13 +1133,29 @@ async def get_log_processes(session_id: str):
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        # Get process list running inside the simulator
-        command = [
-            'xcrun', 'simctl', 'spawn', session.udid,
-            'ps', 'aux'
-        ]
+        # Try multiple strategies to list processes in the simulator.
+        # `ps` may live at /usr/bin/ps inside the iOS simulator container;
+        # fall back to the host-level process list filtered by simulator UDID.
+        success, output = False, ""
 
-        success, output = session_manager.ios_manager._run_command(command)
+        for ps_path in ('/usr/bin/ps', '/bin/ps'):
+            cmd = ['xcrun', 'simctl', 'spawn', session.udid, ps_path, 'aux']
+            success, output = session_manager.ios_manager._run_command(cmd)
+            if success:
+                break
+
+        if not success:
+            # Host-level fallback: list macOS processes related to this simulator
+            host_cmd = ['ps', 'aux']
+            host_success, host_output = session_manager.ios_manager._run_command(host_cmd)
+            if host_success:
+                udid = session.udid
+                filtered = [
+                    line for line in host_output.split('\n')
+                    if udid in line or 'Simulator' in line or 'CoreSimulator' in line
+                ]
+                success = True
+                output = '\n'.join(['USER PID %CPU %MEM VSZ RSS TT STAT STARTED TIME COMMAND'] + filtered)
 
         if success:
             processes = []
@@ -1169,7 +1185,6 @@ async def get_log_processes(session_id: str):
                 "processes": processes
             }
         else:
-            # Command failed -- likely simulator not booted or xcrun unavailable
             raise HTTPException(
                 status_code=503,
                 detail=f"Could not retrieve process list: {output}"

@@ -46,23 +46,18 @@ class IdbStreamService:
         self._latest_width: int = 0
         self._latest_height: int = 0
         self._frame_count: int = 0
+        self._start_time: float = 0.0  # set when start() succeeds
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def start(self) -> bool:
-        """Start the idb video-stream subprocess and reader thread."""
-        if self._running:
-            return True
+    # タイムアウト: この秒数以内にフレームが届かなければ失敗とみなす
+    FIRST_FRAME_TIMEOUT: float = 5.0
 
+    def _try_launch(self, cmd: list) -> bool:
+        """Launch the subprocess and verify it stays running after a short delay."""
         try:
-            cmd = [
-                "idb", "video-stream",
-                "--udid", self.udid,
-                "--format", "mjpeg",
-                "--fps", str(self.fps),
-            ]
             self._process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -70,29 +65,42 @@ class IdbStreamService:
                 bufsize=0,
             )
             time.sleep(0.5)
-
             if self._process.poll() is not None:
                 err = self._process.stderr.read().decode(errors="replace")
-                logger.warning(
-                    f"❌ idb video-stream exited immediately for {self.udid}: {err}"
-                )
+                logger.debug(f"idb video-stream exited for {self.udid}: {err[:200]}")
                 self._process = None
                 return False
-
-            self._running = True
-            self._thread = threading.Thread(
-                target=self._reader_loop, daemon=True
-            )
-            self._thread.start()
-            logger.info(
-                f"✅ IdbStreamService started for {self.udid} @ {self.fps}fps"
-            )
             return True
-
         except Exception as e:
-            logger.error(f"❌ IdbStreamService start error for {self.udid}: {e}")
+            logger.debug(f"idb video-stream launch error for {self.udid}: {e}")
             self._process = None
             return False
+
+    def start(self) -> bool:
+        """Start the idb video-stream subprocess and reader thread.
+
+        Tries with --fps first (not all idb versions support it),
+        then retries without --fps on failure.
+        """
+        if self._running:
+            return True
+
+        base_cmd = ["idb", "video-stream", "--udid", self.udid, "--format", "mjpeg"]
+
+        # Try with --fps, then without
+        for cmd in [base_cmd + ["--fps", str(self.fps)], base_cmd]:
+            if self._try_launch(cmd):
+                break
+        else:
+            logger.warning(f"❌ IdbStreamService could not start for {self.udid}")
+            return False
+
+        self._running = True
+        self._start_time = time.monotonic()
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
+        logger.info(f"✅ IdbStreamService started for {self.udid} @ {self.fps}fps")
+        return True
 
     def stop(self) -> None:
         """Stop the subprocess and reader thread."""
@@ -122,6 +130,15 @@ class IdbStreamService:
             and self._process is not None
             and self._process.poll() is None
         )
+
+    @property
+    def first_frame_timed_out(self) -> bool:
+        """True if the stream started but no frames arrived within FIRST_FRAME_TIMEOUT."""
+        if self._frame_count > 0:
+            return False
+        if self._start_time == 0.0:
+            return False
+        return time.monotonic() - self._start_time > self.FIRST_FRAME_TIMEOUT
 
     @property
     def frame_count(self) -> int:
