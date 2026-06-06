@@ -1304,27 +1304,70 @@
                 </div>
             </div>
         </div>
+
         <!-- Controls Panel -->
         <div class="controls-panel">
-            <div class="controls-section">
-                <h3>📱 Stream Mode</h3>
-                <div class="mode-toggle controls-grid">
-                    <button id="webrtc-btn" onclick="switchMode('webrtc')" class="active">🚀 WebRTC Stream</button>
-                    <button id="video-btn" onclick="switchMode('video')">🎥 WebSocket Stream</button>
-                    <button id="screenshot-btn" onclick="switchMode('screenshot')">📷 Screenshot Mode</button>
+            <div class="controls-section gesture-buttons">
+                <h3>👆 Gesture Controls</h3>
+                <div class="controls-grid-wide">
+                    <button id="swipeToggle" onclick="toggleSwipeMode()">✋ Enable Swipe Mode</button>
+                </div>
+
+                <br>
+
+                <div class="controls-grid">
+                    <button onclick="quickSwipe('up')">⬆️ Up</button>
+                    <button onclick="quickSwipe('down')">⬇️ Down</button>
+                    <button onclick="quickSwipe('left')">⬅️ Left</button>
+                    <button onclick="quickSwipe('right')">➡️ Right</button>
                 </div>
             </div>
 
-            <!-- WebRTC Quality Section -->
-            <div id="webrtc-quality-section" class="controls-section">
-                <h3>🎬 WebRTC Quality</h3>
-                <div class="mode-toggle controls-grid">
-                    <button id="quality-medium-btn" onclick="setWebRTCQuality('medium')">📺 Medium</button>
-                    <button id="quality-high-btn" onclick="setWebRTCQuality('high')" class="active">🏆 High</button>
-                    <button id="quality-ultra-btn" onclick="setWebRTCQuality('ultra')">💎 Ultra</button>
+            <div class="controls-section">
+                <h3>🌐 URL & Deep Links</h3>
+
+                <div class="url-input-section">
+                    <input type="text" id="urlInput" placeholder="Enter URL or deep link..."
+                        style="flex: 1; padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
+                    <button onclick="openUrl()" class="btn-app-launch" style="flex-shrink: 0;">🌐 Open URL</button>
+                    <button onclick="showUrlExamples()" class="btn-primary" style="flex-shrink: 0;">💡 Examples</button>
                 </div>
-                <div style="font-size: 11px; color: #666; margin-top: 8px; text-align: center;">
-                    Medium: 45fps/3Mbps | High: 60fps/5Mbps | Ultra: 60fps/8Mbps
+
+                <div id="urlExamples"
+                    style="display: none; margin-top: 10px; padding: 10px; background: #f8f9fa; border-radius: 4px; font-size: 12px;">
+                    <strong>Examples:</strong><br>
+                    <div style="margin: 5px 0;">
+                        <button onclick="fillUrlExample('https://www.apple.com')" class="url-example-btn">🌐 Apple
+                            Website</button>
+                        <button onclick="fillUrlExample('https://www.google.com')" class="url-example-btn">🔍
+                            Google</button>
+                        <button onclick="fillUrlExample('mailto:test@example.com')" class="url-example-btn">📧
+                            Email</button>
+                    </div>
+                    <div style="margin: 5px 0;">
+                        <button onclick="fillUrlExample('tel:+1234567890')" class="url-example-btn">📞 Phone</button>
+                        <button onclick="fillUrlExample('sms:+1234567890')" class="url-example-btn">💬 SMS</button>
+                        <button onclick="fillUrlExample('maps:?q=Apple Park')" class="url-example-btn">🗺️ Maps</button>
+                    </div>
+                    <div style="margin: 5px 0;">
+                        <button onclick="fillUrlExample('settings:root=General')" class="url-example-btn">⚙️
+                            Settings</button>
+                        <button onclick="fillUrlExample('facetime:+1234567890')" class="url-example-btn">📹
+                            FaceTime</button>
+                        <button onclick="fillUrlExample('shortcuts:')" class="url-example-btn">⚡ Shortcuts</button>
+                    </div>
+                    <div style="font-size: 10px; color: #666; margin-top: 8px;">
+                        💡 Tip: You can also open custom app URL schemes if the app supports them
+                    </div>
+                </div>
+            </div>
+
+            <div class="controls-section">
+                <h3>⌨️ Text Input</h3>
+                <div class="text-input-section">
+                    <input type="text" id="textInput" placeholder="Enter text to type..." maxlength="200">
+                    <button onclick="sendText()">📤 Send</button>
+                    <button onclick="clearText()">🗑️ Clear</button>
                 </div>
             </div>
 
@@ -1460,68 +1503,26 @@
                     </div>
                 </div>
             </div>
+
             <div class="controls-section">
-                <h3>🌐 URL & Deep Links</h3>
-
-                <div class="url-input-section">
-                    <input type="text" id="urlInput" placeholder="Enter URL or deep link..."
-                        style="flex: 1; padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
-                    <button onclick="openUrl()" class="btn-app-launch" style="flex-shrink: 0;">🌐 Open URL</button>
-                    <button onclick="showUrlExamples()" class="btn-primary" style="flex-shrink: 0;">💡 Examples</button>
-                </div>
-
-                <div id="urlExamples"
-                    style="display: none; margin-top: 10px; padding: 10px; background: #f8f9fa; border-radius: 4px; font-size: 12px;">
-                    <strong>Examples:</strong><br>
-                    <div style="margin: 5px 0;">
-                        <button onclick="fillUrlExample('https://www.apple.com')" class="url-example-btn">🌐 Apple
-                            Website</button>
-                        <button onclick="fillUrlExample('https://www.google.com')" class="url-example-btn">🔍
-                            Google</button>
-                        <button onclick="fillUrlExample('mailto:test@example.com')" class="url-example-btn">📧
-                            Email</button>
-                    </div>
-                    <div style="margin: 5px 0;">
-                        <button onclick="fillUrlExample('tel:+1234567890')" class="url-example-btn">📞 Phone</button>
-                        <button onclick="fillUrlExample('sms:+1234567890')" class="url-example-btn">💬 SMS</button>
-                        <button onclick="fillUrlExample('maps:?q=Apple Park')" class="url-example-btn">🗺️ Maps</button>
-                    </div>
-                    <div style="margin: 5px 0;">
-                        <button onclick="fillUrlExample('settings:root=General')" class="url-example-btn">⚙️
-                            Settings</button>
-                        <button onclick="fillUrlExample('facetime:+1234567890')" class="url-example-btn">📹
-                            FaceTime</button>
-                        <button onclick="fillUrlExample('shortcuts:')" class="url-example-btn">⚡ Shortcuts</button>
-                    </div>
-                    <div style="font-size: 10px; color: #666; margin-top: 8px;">
-                        💡 Tip: You can also open custom app URL schemes if the app supports them
-                    </div>
+                <h3>📱 Stream Mode</h3>
+                <div class="mode-toggle controls-grid">
+                    <button id="webrtc-btn" onclick="switchMode('webrtc')" class="active">🚀 WebRTC Stream</button>
+                    <button id="video-btn" onclick="switchMode('video')">🎥 WebSocket Stream</button>
+                    <button id="screenshot-btn" onclick="switchMode('screenshot')">📷 Screenshot Mode</button>
                 </div>
             </div>
 
-            <div class="controls-section">
-                <h3>⌨️ Text Input</h3>
-                <div class="text-input-section">
-                    <input type="text" id="textInput" placeholder="Enter text to type..." maxlength="200">
-                    <button onclick="sendText()">📤 Send</button>
-                    <button onclick="clearText()">🗑️ Clear</button>
+            <!-- WebRTC Quality Section -->
+            <div id="webrtc-quality-section" class="controls-section">
+                <h3>🎬 WebRTC Quality</h3>
+                <div class="mode-toggle controls-grid">
+                    <button id="quality-medium-btn" onclick="setWebRTCQuality('medium')">📺 Medium</button>
+                    <button id="quality-high-btn" onclick="setWebRTCQuality('high')" class="active">🏆 High</button>
+                    <button id="quality-ultra-btn" onclick="setWebRTCQuality('ultra')">💎 Ultra</button>
                 </div>
-            </div>
-
-
-            <div class="controls-section gesture-buttons">
-                <h3>👆 Gesture Controls</h3>
-                <div class="controls-grid-wide">
-                    <button id="swipeToggle" onclick="toggleSwipeMode()">✋ Enable Swipe Mode</button>
-                </div>
-
-                <br>
-
-                <div class="controls-grid">
-                    <button onclick="quickSwipe('up')">⬆️ Up</button>
-                    <button onclick="quickSwipe('down')">⬇️ Down</button>
-                    <button onclick="quickSwipe('left')">⬅️ Left</button>
-                    <button onclick="quickSwipe('right')">➡️ Right</button>
+                <div style="font-size: 11px; color: #666; margin-top: 8px; text-align: center;">
+                    Medium: 45fps/3Mbps | High: 60fps/5Mbps | Ultra: 60fps/8Mbps
                 </div>
             </div>
 
