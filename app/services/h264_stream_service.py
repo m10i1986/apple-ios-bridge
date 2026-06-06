@@ -260,6 +260,7 @@ class H264StreamService:
         ``_Fmp4Writer`` and parsed into MSE init/media segments.
         """
         try:
+            logger.info(f"H264StreamService: opening input FIFO with PyAV for {self.udid}")
             self._in_container = av.open(
                 self._fifo_path,
                 mode="r",
@@ -272,6 +273,11 @@ class H264StreamService:
                 },
             )
             in_stream = self._in_container.streams.video[0]
+            logger.info(
+                f"H264StreamService: input opened for {self.udid} "
+                f"(codec={in_stream.codec_context.name}, "
+                f"{in_stream.codec_context.width}x{in_stream.codec_context.height})"
+            )
 
             self._out_container = av.open(
                 _Fmp4Writer(self),
@@ -288,7 +294,9 @@ class H264StreamService:
                 },
             )
             out_stream = self._out_container.add_stream(template=in_stream)
+            logger.info(f"H264StreamService: output muxer ready for {self.udid}, demuxing...")
 
+            pkt_count = 0
             for packet in self._in_container.demux(in_stream):
                 if not self._running:
                     break
@@ -296,6 +304,12 @@ class H264StreamService:
                     continue  # flush/incomplete packet
                 packet.stream = out_stream
                 self._out_container.mux(packet)
+                pkt_count += 1
+                if pkt_count <= 3:
+                    logger.info(
+                        f"H264StreamService: muxed packet #{pkt_count} "
+                        f"({packet.size} bytes) for {self.udid}"
+                    )
         except Exception as e:
             logger.error(f"H264StreamService reader error for {self.udid}: {e}")
         finally:
@@ -310,6 +324,11 @@ class H264StreamService:
         if not chunk:
             return
         self._parse_buffer += chunk
+        if not self._init_collected:
+            logger.info(
+                f"H264StreamService: muxer wrote {len(chunk)} bytes "
+                f"(buffer={len(self._parse_buffer)}) for {self.udid}"
+            )
 
         while len(self._parse_buffer) >= 8:
             size = int.from_bytes(self._parse_buffer[:4], "big")
