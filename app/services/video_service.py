@@ -1,9 +1,12 @@
+import base64
+import io
 import threading
 import time
 import subprocess
 import queue
 from typing import List, Optional, Dict
 from queue import Queue, Empty
+from PIL import Image
 from app.config.settings import settings
 from app.core.logging import logger
 from app.services.screenshot_service import ScreenshotService
@@ -12,6 +15,9 @@ from app.utils.system_utils import SystemUtils
 
 class VideoService:
     """Service for video streaming with dynamic UDID support"""
+
+    # Scale factor to match WebRTC 'high' quality (0.40) for consistent display size
+    VIDEO_STREAM_SCALE: float = 0.40
 
     def __init__(self, udid: Optional[str] = None):
         self.udid = udid
@@ -203,12 +209,29 @@ class VideoService:
                 frame_data = stream.get_latest_frame_b64()
                 if frame_data and stream.frame_count != last_frame_count:
                     last_frame_count = stream.frame_count
+                    src_w = frame_data["pixel_width"]
+                    src_h = frame_data["pixel_height"]
+                    target_w = max(2, int(src_w * VideoService.VIDEO_STREAM_SCALE))
+                    target_h = max(2, int(src_h * VideoService.VIDEO_STREAM_SCALE))
+                    if target_w != src_w:
+                        image_bytes = base64.b64decode(frame_data["data"])
+                        with Image.open(io.BytesIO(image_bytes)) as img:
+                            if img.mode != 'RGB':
+                                img = img.convert('RGB')
+                            img = img.resize((target_w, target_h), Image.Resampling.BILINEAR)
+                            buf = io.BytesIO()
+                            img.save(buf, format='JPEG', quality=settings.STREAM_JPEG_QUALITY, optimize=False)
+                            enqueue_data = base64.b64encode(buf.getvalue()).decode('utf-8')
+                        enqueue_w, enqueue_h = target_w, target_h
+                    else:
+                        enqueue_data = frame_data["data"]
+                        enqueue_w, enqueue_h = src_w, src_h
                     self._enqueue_frame({
-                        "data": frame_data["data"],
+                        "data": enqueue_data,
                         "timestamp": time.time(),
                         "format": "jpeg",
-                        "pixel_width": frame_data["pixel_width"],
-                        "pixel_height": frame_data["pixel_height"],
+                        "pixel_width": enqueue_w,
+                        "pixel_height": enqueue_h,
                     })
 
                 # Yield CPU; idb stream reader runs in its own thread
@@ -305,12 +328,29 @@ class VideoService:
                 try:
                     screenshot_data = self.screenshot_service.capture_ultra_fast_screenshot()
                     if screenshot_data:
+                        src_w = screenshot_data.get("pixel_width", 390)
+                        src_h = screenshot_data.get("pixel_height", 844)
+                        target_w = max(2, int(src_w * VideoService.VIDEO_STREAM_SCALE))
+                        target_h = max(2, int(src_h * VideoService.VIDEO_STREAM_SCALE))
+                        if target_w != src_w:
+                            image_bytes = base64.b64decode(screenshot_data["data"])
+                            with Image.open(io.BytesIO(image_bytes)) as img:
+                                if img.mode != 'RGB':
+                                    img = img.convert('RGB')
+                                img = img.resize((target_w, target_h), Image.Resampling.BILINEAR)
+                                buf = io.BytesIO()
+                                img.save(buf, format='JPEG', quality=settings.STREAM_JPEG_QUALITY, optimize=False)
+                                enqueue_data = base64.b64encode(buf.getvalue()).decode('utf-8')
+                            enqueue_w, enqueue_h = target_w, target_h
+                        else:
+                            enqueue_data = screenshot_data["data"]
+                            enqueue_w, enqueue_h = src_w, src_h
                         self._enqueue_frame({
-                            "data": screenshot_data["data"],
+                            "data": enqueue_data,
                             "timestamp": current_time,
                             "format": "jpeg",
-                            "pixel_width": screenshot_data.get("pixel_width", 390),
-                            "pixel_height": screenshot_data.get("pixel_height", 844)
+                            "pixel_width": enqueue_w,
+                            "pixel_height": enqueue_h
                         })
 
                         frame_count += 1

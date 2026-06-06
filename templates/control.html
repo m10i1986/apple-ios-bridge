@@ -1309,8 +1309,8 @@
             <div class="controls-section">
                 <h3>📱 Stream Mode</h3>
                 <div class="mode-toggle controls-grid">
-                    <button id="webrtc-btn" onclick="switchMode('webrtc')">🚀 WebRTC Stream</button>
-                    <button id="video-btn" onclick="switchMode('video')" class="active">🎥 WebSocket Stream</button>
+                    <button id="webrtc-btn" onclick="switchMode('webrtc')" class="active">🚀 WebRTC Stream</button>
+                    <button id="video-btn" onclick="switchMode('video')">🎥 WebSocket Stream</button>
                     <button id="screenshot-btn" onclick="switchMode('screenshot')">📷 Screenshot Mode</button>
                 </div>
             </div>
@@ -1691,7 +1691,7 @@
         const webrtcVideo = document.getElementById('webrtc-video');
         let currentWebRTCQuality = 'high';
 
-        let currentMode = 'video';
+        let currentMode = 'webrtc';
         let videoWs = null;
         let screenshotWs = null;
         let controlWs = null;
@@ -1900,7 +1900,7 @@
         function init() {
             setupControlWebSocket();
             setupKeyboardShortcuts();
-            switchMode('video');
+            switchMode('webrtc');
             loadInstalledApps();
             loadAppsListState();
             // Initialize logs and location
@@ -2717,7 +2717,7 @@
             const text = textInput.value.trim();
             if (!text) return;
 
-            // Send text regardless of mode - always use control WebSocket  
+            // Send text regardless of mode - always use control WebSocket
             if (controlWs) {
                 controlWs.send(JSON.stringify({ t: 'text', text: text }));
                 showTemporaryStatus(`Text sent: "${text}"`);
@@ -3263,7 +3263,7 @@
         function setWebRTCQuality(preset) {
             const presets = {
                 'low': { fps: 30, bitrate: 1500000 },      // 1.5 Mbps, 30fps
-                'medium': { fps: 45, bitrate: 3000000 },   // 3 Mbps, 45fps  
+                'medium': { fps: 45, bitrate: 3000000 },   // 3 Mbps, 45fps
                 'high': { fps: 60, bitrate: 5000000 },     // 5 Mbps, 60fps
                 'ultra': { fps: 60, bitrate: 8000000 }     // 8 Mbps, 60fps
             };
@@ -3477,7 +3477,7 @@
         function init() {
             setupControlWebSocket();
             setupKeyboardShortcuts();
-            switchMode('video');
+            switchMode('webrtc');
             loadInstalledApps();
             loadAppsListState(); // Add this line
 
