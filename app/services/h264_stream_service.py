@@ -79,7 +79,6 @@ class H264StreamService:
         self._clients_lock = threading.Lock()
         self._clients: Set = set()  # type: ignore[type-arg]
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._fifo_keepalive_fd: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -90,30 +89,39 @@ class H264StreamService:
             return True
         self._loop = loop
 
-        fifo_path = f"/tmp/ios_bridge_h264_{self.udid}_{os.getpid()}.pipe"
+        # Use an anonymous pipe (os.pipe()) instead of a named FIFO.
+        # Named FIFOs with simctl --force caused unlink+recreate: simctl would
+        # delete our FIFO and create a new regular file, breaking the ffmpeg
+        # connection.  An anonymous pipe avoids this: both ends are immediately
+        # connected and the path is never exposed to simctl for manipulation.
+        #
+        # simctl writes to /dev/fd/{w_fd}: on macOS /dev/fd/N is a magic path
+        # that dups the inherited fd N when opened, connecting to our pipe.
+        # ffmpeg reads via pipe:{r_fd}: ffmpeg's pipe: protocol uses the fd
+        # directly without any open() call, so no blocking or path issues.
         try:
-            if os.path.exists(fifo_path):
-                os.unlink(fifo_path)
-            os.mkfifo(fifo_path, mode=0o600)
+            r_fd, w_fd = os.pipe()
         except Exception as e:
-            logger.error(f"H264StreamService: FIFO creation failed for {self.udid}: {e}")
-            return False
-        self._fifo_path = fifo_path
-
-        # Open the FIFO with O_RDWR so ffmpeg's O_RDONLY open() returns
-        # immediately without blocking.  simctl lazily opens the write-end
-        # only when the first video frame arrives, which can take >30 s on a
-        # cold simulator.  Keeping this fd open also prevents a spurious EOF
-        # on the pipe before simctl connects.
-        try:
-            self._fifo_keepalive_fd = os.open(fifo_path, os.O_RDWR)
-        except Exception as e:
-            logger.error(f"H264StreamService: FIFO keepalive open failed for {self.udid}: {e}")
-            self._cleanup_processes()
+            logger.error(f"H264StreamService: pipe() failed for {self.udid}: {e}")
             return False
 
-        # Start ffmpeg (reader).  open(FIFO, O_RDONLY) no longer blocks because
-        # _fifo_keepalive_fd already holds a write-side reference.
+        # Launch simctl writing into the write-end of the anonymous pipe.
+        try:
+            self._simctl = subprocess.Popen(
+                ["xcrun", "simctl", "io", self.udid,
+                 "recordVideo", "--codec=h264", "--force", f"/dev/fd/{w_fd}"],
+                pass_fds=(w_fd,),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except Exception as e:
+            logger.error(f"H264StreamService: simctl launch failed for {self.udid}: {e}")
+            os.close(r_fd)
+            os.close(w_fd)
+            return False
+        os.close(w_fd)  # parent no longer needs write-end; simctl has a dup
+
+        # Launch ffmpeg reading from the read-end via ffmpeg's pipe: protocol.
         try:
             self._ffmpeg = subprocess.Popen(
                 [
@@ -123,7 +131,7 @@ class H264StreamService:
                     "-flags", "+low_delay",
                     "-probesize", "1000000",
                     "-analyzeduration", "1000000",
-                    "-i", fifo_path,
+                    "-i", f"pipe:{r_fd}",
                     "-c:v", "copy",
                     "-an",
                     "-movflags", "+frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
@@ -131,28 +139,17 @@ class H264StreamService:
                     "-f", "mp4",
                     "pipe:1",
                 ],
+                pass_fds=(r_fd,),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
             )
         except Exception as e:
             logger.error(f"H264StreamService: ffmpeg launch failed for {self.udid}: {e}")
+            os.close(r_fd)
             self._cleanup_processes()
             return False
-
-        # Start simctl (writer).  Opens the FIFO lazily on first frame; the
-        # keepalive fd ensures the pipe stays alive until then.
-        try:
-            self._simctl = subprocess.Popen(
-                ["xcrun", "simctl", "io", self.udid,
-                 "recordVideo", "--codec=h264", "--force", fifo_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-        except Exception as e:
-            logger.error(f"H264StreamService: simctl launch failed for {self.udid}: {e}")
-            self._cleanup_processes()
-            return False
+        os.close(r_fd)  # parent no longer needs read-end; ffmpeg has a dup
 
         self._running = True
 
@@ -234,17 +231,7 @@ class H264StreamService:
                 pass
             self._ffmpeg = None
 
-        if self._fifo_keepalive_fd is not None:
-            try:
-                os.close(self._fifo_keepalive_fd)
-            except Exception:
-                pass
-            self._fifo_keepalive_fd = None
-
-        if self._fifo_path:
-            try: os.unlink(self._fifo_path)
-            except Exception: pass
-            self._fifo_path = None
+        # No FIFO or keepalive fds to clean up (anonymous pipe is used instead).
 
     # ------------------------------------------------------------------
     # Reader / broadcaster
