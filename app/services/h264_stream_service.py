@@ -79,6 +79,7 @@ class H264StreamService:
         self._clients_lock = threading.Lock()
         self._clients: Set = set()  # type: ignore[type-arg]
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._fifo_keepalive_fd: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -99,8 +100,20 @@ class H264StreamService:
             return False
         self._fifo_path = fifo_path
 
-        # Start ffmpeg (reader).  open(FIFO, O_RDONLY) blocks until simctl
-        # opens the write side.  Popen returns immediately regardless.
+        # Open the FIFO with O_RDWR so ffmpeg's O_RDONLY open() returns
+        # immediately without blocking.  simctl lazily opens the write-end
+        # only when the first video frame arrives, which can take >30 s on a
+        # cold simulator.  Keeping this fd open also prevents a spurious EOF
+        # on the pipe before simctl connects.
+        try:
+            self._fifo_keepalive_fd = os.open(fifo_path, os.O_RDWR)
+        except Exception as e:
+            logger.error(f"H264StreamService: FIFO keepalive open failed for {self.udid}: {e}")
+            self._cleanup_processes()
+            return False
+
+        # Start ffmpeg (reader).  open(FIFO, O_RDONLY) no longer blocks because
+        # _fifo_keepalive_fd already holds a write-side reference.
         try:
             self._ffmpeg = subprocess.Popen(
                 [
@@ -127,7 +140,8 @@ class H264StreamService:
             self._cleanup_processes()
             return False
 
-        # Start simctl (writer).  Blocks open() until ffmpeg's reader is ready.
+        # Start simctl (writer).  Opens the FIFO lazily on first frame; the
+        # keepalive fd ensures the pipe stays alive until then.
         try:
             self._simctl = subprocess.Popen(
                 ["xcrun", "simctl", "io", self.udid,
@@ -219,6 +233,13 @@ class H264StreamService:
             except Exception:
                 pass
             self._ffmpeg = None
+
+        if self._fifo_keepalive_fd is not None:
+            try:
+                os.close(self._fifo_keepalive_fd)
+            except Exception:
+                pass
+            self._fifo_keepalive_fd = None
 
         if self._fifo_path:
             try: os.unlink(self._fifo_path)
