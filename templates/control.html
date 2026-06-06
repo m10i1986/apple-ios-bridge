@@ -1507,9 +1507,18 @@
             <div class="controls-section">
                 <h3>📱 Stream Mode</h3>
                 <div class="mode-toggle controls-grid">
-                    <button id="video-btn" onclick="switchMode('video')" class="active">🎥 WebSocket Stream</button>
+                    <button id="video-btn" onclick="switchMode('websocket')" class="active">🎥 WebSocket Stream</button>
                     <button id="webrtc-btn" onclick="switchMode('webrtc')">🚀 WebRTC Stream</button>
                     <button id="screenshot-btn" onclick="switchMode('screenshot')">📷 Screenshot Mode</button>
+                </div>
+            </div>
+
+            <!-- WebSocket Type Section -->
+            <div id="websocket-type-section" class="controls-section">
+                <h3>🎬 WebSocket Type</h3>
+                <div class="mode-toggle controls-grid">
+                    <button id="ws-datatype-auto-btn" onclick="setWebSocketDataType('auto')">📺 auto</button>
+                    <button id="ws-datatype-h264-btn" onclick="setWebSocketDataType('h264')" class="active">🎞️ H.264</button>
                 </div>
             </div>
 
@@ -1692,9 +1701,15 @@
         const webrtcVideo = document.getElementById('webrtc-video');
         let currentWebRTCQuality = 'high';
 
-        let currentMode = 'video';
+        let currentMode = 'websocket';
+        let currentWsDataType = 'h264';  // 'auto' or 'h264'
         let videoWs = null;
         let screenshotWs = null;
+        let h264Ws = null;
+        let h264MediaSource = null;
+        let h264SourceBuffer = null;
+        let h264Queue = [];
+        let h264Mime = null;
         let controlWs = null;
 
         // WebRTC variables
@@ -1901,7 +1916,7 @@
         function init() {
             setupControlWebSocket();
             setupKeyboardShortcuts();
-            switchMode('video');
+            switchMode('websocket');
             loadInstalledApps();
             loadAppsListState();
             // Initialize logs and location
@@ -2265,7 +2280,8 @@
                 }
                 switch (e.key) {
                     case 'w': switchMode('webrtc'); break;
-                    case 'v': switchMode('video'); break;
+                    case 'v': switchMode('websocket'); break;
+                    case '4': switchMode('h264'); break;
                     case 'c': switchMode('screenshot'); break;
                     case 'h': pressButton('home'); break;
                     case 'l': pressButton('lock'); break;
@@ -2342,25 +2358,70 @@
                 webrtcQualitySection.classList.remove('visible');
             }
 
+            // Show/hide WebSocket type section
+            const wsTypeSection = document.getElementById('websocket-type-section');
+            if (mode === 'websocket') {
+                wsTypeSection.style.display = '';
+            } else {
+                wsTypeSection.style.display = 'none';
+            }
+
             // Clean up existing connections
             if (videoWs) videoWs.close();
             if (screenshotWs) screenshotWs.close();
+            if (h264Ws) h264Ws.close();
             if (webrtcWs) webrtcWs.close();
             if (peerConnection) {
                 peerConnection.close();
                 peerConnection = null;
             }
 
-            // Hide/show appropriate elements
-            canvas.style.display = mode === 'webrtc' ? 'none' : 'block';
-            webrtcVideo.style.display = mode === 'webrtc' ? 'block' : 'none';
-
-            if (mode === 'video') {
-                setupHighPerformanceVideoStream();
+            if (mode === 'websocket') {
+                if (currentWsDataType === 'h264') {
+                    canvas.style.display = 'none';
+                    webrtcVideo.style.display = 'block';
+                    setupH264Stream();
+                } else {
+                    canvas.style.display = 'block';
+                    webrtcVideo.style.display = 'none';
+                    setupHighPerformanceVideoStream();
+                }
             } else if (mode === 'screenshot') {
+                canvas.style.display = 'block';
+                webrtcVideo.style.display = 'none';
                 setupScreenshotMode();
             } else if (mode === 'webrtc') {
+                canvas.style.display = 'none';
+                webrtcVideo.style.display = 'block';
                 setupWebRTCStream();
+            }
+        }
+
+        function setWebSocketDataType(type) {
+            currentWsDataType = type;
+
+            // Update button highlighting
+            document.getElementById('ws-datatype-auto-btn').classList.remove('active');
+            document.getElementById('ws-datatype-h264-btn').classList.remove('active');
+            if (type === 'h264') {
+                document.getElementById('ws-datatype-h264-btn').classList.add('active');
+            } else {
+                document.getElementById('ws-datatype-auto-btn').classList.add('active');
+            }
+
+            // Restart stream if currently in websocket mode
+            if (currentMode === 'websocket') {
+                if (videoWs) videoWs.close();
+                if (h264Ws) h264Ws.close();
+                if (type === 'h264') {
+                    canvas.style.display = 'none';
+                    webrtcVideo.style.display = 'block';
+                    setupH264Stream();
+                } else {
+                    canvas.style.display = 'block';
+                    webrtcVideo.style.display = 'none';
+                    setupHighPerformanceVideoStream();
+                }
             }
         }
 
@@ -2373,11 +2434,88 @@
             // Add active class to current mode button
             if (currentMode === 'webrtc') {
                 document.getElementById('webrtc-btn').classList.add('active');
-            } else if (currentMode === 'video') {
+            } else if (currentMode === 'websocket') {
                 document.getElementById('video-btn').classList.add('active');
             } else if (currentMode === 'screenshot') {
                 document.getElementById('screenshot-btn').classList.add('active');
             }
+        }
+
+        function setupH264Stream() {
+            canvas.style.display = 'none';
+            webrtcVideo.style.display = 'block';
+
+            h264MediaSource = null;
+            h264SourceBuffer = null;
+            h264Queue = [];
+            h264Mime = null;
+
+            h264Ws = new WebSocket(`ws://${location.hostname}:8000/ws/${SESSION_ID}/video_h264`);
+            h264Ws.binaryType = 'arraybuffer';
+
+            h264Ws.onopen = () => {
+                console.log('H.264 fMP4 WebSocket connected');
+                status.textContent = 'H.264 stream connecting...';
+                status.className = 'connected';
+            };
+
+            h264Ws.onclose = () => {
+                status.textContent = 'H.264 stream disconnected';
+                status.className = 'disconnected';
+            };
+
+            h264Ws.onerror = (e) => {
+                console.error('H.264 WebSocket error:', e);
+                status.textContent = 'H.264 stream error';
+                status.className = 'disconnected';
+            };
+
+            h264Ws.onmessage = (event) => {
+                if (typeof event.data === 'string') {
+                    // JSON init message: {"type":"init","mime":"video/mp4; codecs=\"...\""}
+                    try {
+                        const msg = JSON.parse(event.data);
+                        if (msg.type === 'init') {
+                            h264Mime = msg.mime;
+                            if (!MediaSource.isTypeSupported(h264Mime)) {
+                                console.warn('H.264 mime not supported, trying fallback');
+                                h264Mime = 'video/mp4; codecs="avc1.42E01E"';
+                            }
+                            h264MediaSource = new MediaSource();
+                            webrtcVideo.src = URL.createObjectURL(h264MediaSource);
+                            h264MediaSource.addEventListener('sourceopen', () => {
+                                h264SourceBuffer = h264MediaSource.addSourceBuffer(h264Mime);
+                                h264SourceBuffer.mode = 'segments';
+                                h264SourceBuffer.addEventListener('updateend', () => {
+                                    if (h264Queue.length > 0 && !h264SourceBuffer.updating) {
+                                        h264SourceBuffer.appendBuffer(h264Queue.shift());
+                                    }
+                                });
+                                status.textContent = 'H.264 stream active';
+                            });
+                            webrtcVideo.play().catch(() => {});
+                        }
+                    } catch (e) {
+                        console.error('H.264 JSON parse error:', e);
+                    }
+                } else {
+                    // Binary: init segment or media segment
+                    const chunk = new Uint8Array(event.data);
+                    if (!h264SourceBuffer) {
+                        h264Queue.push(chunk);
+                        return;
+                    }
+                    if (h264SourceBuffer.updating) {
+                        h264Queue.push(chunk);
+                    } else {
+                        try {
+                            h264SourceBuffer.appendBuffer(chunk);
+                        } catch (e) {
+                            console.warn('H.264 appendBuffer error:', e);
+                        }
+                    }
+                }
+            };
         }
 
         function setupHighPerformanceVideoStream() {
@@ -2598,7 +2736,7 @@
 
                 if (currentMode === 'screenshot' && screenshotWs) {
                     screenshotWs.send(JSON.stringify({ t: 'tap', x: tapX, y: tapY }));
-                } else if (currentMode === 'video' && controlWs) {
+                } else if (currentMode === 'websocket' && controlWs) {
                     controlWs.send(JSON.stringify({ t: 'tap', x: tapX, y: tapY }));
                 }
 
@@ -2629,7 +2767,7 @@
 
                 if (currentMode === 'screenshot' && screenshotWs) {
                     screenshotWs.send(JSON.stringify(swipeData));
-                } else if (currentMode === 'video' && controlWs) {
+                } else if (currentMode === 'websocket' && controlWs) {
                     controlWs.send(JSON.stringify(swipeData));
                 }
 
@@ -2735,7 +2873,7 @@
         function showTemporaryStatus(message) {
             const oldText = status.textContent;
             const modePrefix = currentMode === 'webrtc' ? '🚀 ' :
-                currentMode === 'video' ? '🎥 ' : '📷 ';
+                currentMode === 'websocket' ? '🎥 ' : '📷 ';
             status.textContent = modePrefix + message;
             setTimeout(() => {
                 if (status.textContent === modePrefix + message) {
@@ -3478,7 +3616,7 @@
         function init() {
             setupControlWebSocket();
             setupKeyboardShortcuts();
-            switchMode('video');
+            switchMode('websocket');
             loadInstalledApps();
             loadAppsListState(); // Add this line
 
@@ -3508,7 +3646,7 @@
         window.addEventListener('resize', () => {
             if (currentMode === 'webrtc' && webrtcVideo.videoWidth > 0) {
                 resizeWebRTCVideo();
-            } else if (currentMode === 'video' && pixelWidth > 0) {
+            } else if (currentMode === 'websocket' && pixelWidth > 0) {
                 // Trigger a resize recalculation
                 setTimeout(() => {
                     const img = new Image();
