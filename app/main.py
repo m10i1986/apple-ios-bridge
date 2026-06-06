@@ -20,6 +20,7 @@ from app.api.websockets.control_ws import ControlWebSocket
 from app.api.websockets.video_ws import VideoWebSocket
 from app.api.websockets.screenshot_ws import ScreenshotWebSocket
 from app.api.websockets.webrtc_ws import WebRTCWebSocket
+from app.api.websockets.video_h264_ws import VideoH264WebSocket
 from app.services.fast_webrtc_service import FastWebRTCService
 from app.services.connection_manager import connection_manager, managed_connection
 from app.services.resource_manager import resource_manager
@@ -136,6 +137,33 @@ async def video_websocket(websocket: WebSocket, session_id: str):
         # Release video service when client disconnects
         if 'udid' in locals():
             await resource_manager.release_video_service(udid, f"video_ws_{session_id}")
+
+@app.websocket("/ws/{session_id}/video_h264")
+async def video_h264_websocket(websocket: WebSocket, session_id: str):
+    """H.264 fragmented MP4 video WebSocket endpoint.
+
+    Streams remuxed H.264 from `xcrun simctl io <udid> recordVideo` as
+    fragmented MP4 binary frames that the browser can feed directly into
+    MediaSource Extensions. No JPEG re-encoding, low CPU, near-native FPS.
+    """
+    try:
+        udid = session_manager.get_session_udid(session_id)
+        if not udid:
+            await websocket.accept()
+            await websocket.close(code=4004, reason="Session not found")
+            return
+
+        await websocket.accept()
+
+        client_ip = getattr(websocket.client, 'host', None) if websocket.client else None
+        async with managed_connection(session_id, "video_h264_websocket", websocket, client_ip):
+            handler = VideoH264WebSocket()
+            await handler.handle_connection(websocket, udid)
+
+    except WebSocketDisconnect:
+        logger.info(f"H264 video WebSocket disconnected for session: {session_id}")
+    except Exception as e:
+        logger.error(f"H264 video WebSocket error for session {session_id}: {e}")
 
 @app.websocket("/ws/{session_id}/webrtc")
 async def webrtc_websocket(websocket: WebSocket, session_id: str):

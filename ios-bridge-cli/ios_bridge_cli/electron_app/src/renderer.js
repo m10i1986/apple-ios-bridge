@@ -19,15 +19,23 @@ class IOSBridgeRenderer {
         this.keyboardMode = false;
         this.realtimeMode = false;
         this.isRecording = false;
-        
+
         // File selection for app install
         this.selectedFile = null;
-        
+
         // WebRTC properties
-        this.streamMode = 'websocket'; // 'websocket' or 'webrtc'
+        this.streamMode = 'websocket'; // 'websocket' | 'webrtc' | 'h264'
         this.peerConnection = null;
         this.webrtcVideo = null;
-        
+
+        // H.264 (MSE) properties
+        this.h264Video = null;
+        this.mseMediaSource = null;
+        this.mseSourceBuffer = null;
+        this.msePendingChunks = [];
+        this.mseSourceUrl = null;
+        this.mseInitReceived = false;
+
         // Initialize when DOM is ready
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', () => this.init());
@@ -35,35 +43,38 @@ class IOSBridgeRenderer {
             this.init();
         }
     }
-    
+
     async init() {
         try {
             // Get configuration from main process
             this.config = await window.electronAPI.getConfig();
-            
+
             // Construct serverUrl from serverHost and serverPort if not present
             if (!this.config.serverUrl && this.config.serverHost && this.config.serverPort) {
                 this.config.serverUrl = `http://${this.config.serverHost}:${this.config.serverPort}`;
             }
-            
+
             // Initialize UI
             this.initializeUI();
-            
+
             // Set up event listeners
             this.setupEventListeners();
-        
-        // Initialize WebRTC video element
-        this.webrtcVideo = document.getElementById('webrtc-video');
-            
+
+            // Initialize WebRTC video element
+            this.webrtcVideo = document.getElementById('webrtc-video');
+
+            // Initialize H.264 (MSE) video element
+            this.h264Video = document.getElementById('h264-video');
+
             // Connect to iOS Bridge
             await this.connect();
-            
+
         } catch (error) {
             console.error('Initialization error:', error);
             this.showError('Failed to initialize iOS Bridge Desktop');
         }
     }
-    
+
     initializeUI() {
         // Update device info
         const deviceName = document.getElementById('device-name');
@@ -73,14 +84,14 @@ class IOSBridgeRenderer {
             const iosVersion = sessionInfo.ios_version || '';
             deviceName.textContent = `${deviceType} ${iosVersion}`.trim();
         }
-        
+
         // Initialize stream mode indicator
         const streamModeIndicator = document.getElementById('stream-mode-indicator');
         if (streamModeIndicator) {
             streamModeIndicator.textContent = 'WebSocket';
             streamModeIndicator.className = 'websocket';
         }
-        
+
         // Set device and stream dimensions from config
         const sessionInfo = this.config?.sessionInfo || {};
         if (sessionInfo.device_width && sessionInfo.device_height) {
@@ -97,20 +108,20 @@ class IOSBridgeRenderer {
             };
             console.log(`Using stream pixel dimensions from config: ${this.streamDimensions.width}x${this.streamDimensions.height}`);
         }
-        
+
         // Initialize canvas
         this.canvas = document.getElementById('video-canvas');
         this.touchOverlay = document.getElementById('touch-overlay');
         this.deviceScreen = document.querySelector('.device-screen');
-        
+
         if (this.canvas) {
             this.ctx = this.canvas.getContext('2d');
         }
-        
+
         if (!this.canvas || !this.touchOverlay) {
             return;
         }
-        
+
         // If we already have stream dimensions, inform main to size the window and set CSS size
         if (this.streamDimensions.width > 0 && this.streamDimensions.height > 0) {
             window.electronAPI.resizeWindow(this.streamDimensions.width, this.streamDimensions.height)
@@ -123,11 +134,11 @@ class IOSBridgeRenderer {
                 })
                 .catch(err => console.error('resizeWindow error:', err));
         }
-        
+
         // Initialize quality display
         this.updateQualityDisplay();
     }
-    
+
     setupEventListeners() {
         // Device action buttons
         document.querySelectorAll('[data-action]').forEach(button => {
@@ -136,7 +147,7 @@ class IOSBridgeRenderer {
                 this.handleDeviceAction(action);
             });
         });
-        
+
         // Quality menu
         document.querySelectorAll('#quality-menu .dropdown-item').forEach(item => {
             item.addEventListener('click', (e) => {
@@ -145,30 +156,30 @@ class IOSBridgeRenderer {
                 this.setQuality(quality);
             });
         });
-        
+
         // Window control buttons
         document.getElementById('minimize-btn')?.addEventListener('click', (e) => {
             e.preventDefault();
             this.minimizeWindow();
         });
-        
+
         document.getElementById('close-btn')?.addEventListener('click', (e) => {
             e.preventDefault();
             this.closeWindow();
         });
-        
+
         // Quality/Settings dropdown toggle
         document.getElementById('quality-btn')?.addEventListener('click', (e) => {
             e.preventDefault();
             this.toggleQualityMenu();
         });
-        
+
         // Swipe dropdown toggle and menu items
         document.getElementById('swipe-btn')?.addEventListener('click', (e) => {
             e.preventDefault();
             this.toggleSwipeMenu();
         });
-        
+
         document.querySelectorAll('#swipe-menu .dropdown-item').forEach(item => {
             item.addEventListener('click', (e) => {
                 e.preventDefault();
@@ -176,164 +187,176 @@ class IOSBridgeRenderer {
                 this.performSwipeGesture(swipeDirection);
             });
         });
-        
+
         // Keyboard input section controls
         document.getElementById('send-text-btn')?.addEventListener('click', (e) => {
             e.preventDefault();
             this.sendKeyboardText();
         });
-        
+
         document.getElementById('clear-text-btn')?.addEventListener('click', (e) => {
             e.preventDefault();
             this.clearKeyboardText();
         });
-        
+
         document.getElementById('keyboard-input')?.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') {
                 this.sendKeyboardText();
             }
         });
-        
+
         // Real-time mode toggle
         document.getElementById('realtime-mode-toggle')?.addEventListener('change', (e) => {
             this.toggleRealtimeMode(e.target.checked);
         });
-        
+
         // Real-time keyboard input capture
         document.getElementById('keyboard-input')?.addEventListener('keydown', (e) => {
             if (this.realtimeMode) {
                 this.handleRealtimeKeyPress(e);
             }
         });
-        
+
         // Modal close
         document.getElementById('info-modal')?.addEventListener('click', (e) => {
             if (e.target.id === 'info-modal') {
                 this.closeModal();
             }
         });
-        
+
         // Modal close button
         document.querySelector('.modal-close')?.addEventListener('click', (e) => {
             this.closeModal();
         });
-        
+
         // Setup canvas event listeners
         this.setupCanvasEventListeners();
-        
+
         // Keyboard input
         document.addEventListener('keydown', this.handleKeyDown.bind(this));
-        
+
         // Listen for device actions from main process (menu shortcuts)
         window.electronAPI?.onDeviceAction((action) => {
             this.handleDeviceAction(action);
         });
-        
+
         // Close menus when clicking outside
         document.addEventListener('click', (e) => {
             const qualityBtn = document.getElementById('quality-btn');
             const qualityMenu = document.getElementById('quality-menu');
             const swipeBtn = document.getElementById('swipe-btn');
             const swipeMenu = document.getElementById('swipe-menu');
-            
-            if (qualityBtn && qualityMenu && 
-                !qualityBtn.contains(e.target) && 
+
+            if (qualityBtn && qualityMenu &&
+                !qualityBtn.contains(e.target) &&
                 !qualityMenu.contains(e.target)) {
                 qualityMenu.classList.remove('show');
             }
-            
-            if (swipeBtn && swipeMenu && 
-                !swipeBtn.contains(e.target) && 
+
+            if (swipeBtn && swipeMenu &&
+                !swipeBtn.contains(e.target) &&
                 !swipeMenu.contains(e.target)) {
                 swipeMenu.classList.remove('show');
             }
         });
     }
-    
+
     setupCanvasEventListeners() {
         // Use touch overlay for events since it's on top of the canvas
         const eventTarget = this.touchOverlay || this.canvas;
-        
+
         if (eventTarget) {
             // Remove existing listeners first to avoid duplicates
             eventTarget.removeEventListener('mousedown', this.handleTouchStart);
             eventTarget.removeEventListener('mousemove', this.handleTouchMove);
             eventTarget.removeEventListener('mouseup', this.handleTouchEnd);
-            
+
             // Add new listeners (used for WebSocket/canvas mode)
             eventTarget.addEventListener('mousedown', this.handleTouchStart.bind(this));
             eventTarget.addEventListener('mousemove', this.handleTouchMove.bind(this));
             eventTarget.addEventListener('mouseup', this.handleTouchEnd.bind(this));
-            
+
             eventTarget.style.cursor = 'crosshair';
         }
     }
-    
-    
+
+
     async connect() {
         try {
             this.disconnect();
-            
+
             const sessionId = this.config?.sessionId;
             const serverUrl = this.config?.serverUrl;
-            
+
             if (!sessionId || !serverUrl) {
                 throw new Error('Missing session ID or server URL');
             }
-            
+
             // Create WebSocket URLs
             const wsBase = serverUrl.replace('http://', 'ws://').replace('https://', 'wss://');
             const wsUrls = {
                 video: `${wsBase}/ws/${sessionId}/video`,
                 webrtc: `${wsBase}/ws/${sessionId}/webrtc`,
+                video_h264: `${wsBase}/ws/${sessionId}/video_h264`,
                 control: `${wsBase}/ws/${sessionId}/control`
             };
-            
+
             // Connect based on stream mode
             console.log(`🎯 Current stream mode: ${this.streamMode}`);
-            
+
             if (this.streamMode === 'webrtc') {
                 console.log('🚀 Setting up WebRTC mode...');
                 // Show WebRTC video, hide canvas, and ensure overlay doesn't intercept events
                 this.canvas.style.display = 'none';
                 this.webrtcVideo.style.display = 'block';
+                if (this.h264Video) this.h264Video.style.display = 'none';
                 if (this.touchOverlay) this.touchOverlay.style.pointerEvents = 'none';
                 console.log('👀 Canvas hidden, WebRTC video shown, overlay disabled for pointer events');
                 await this.connectWebRTC(wsUrls.webrtc);
+            } else if (this.streamMode === 'h264') {
+                console.log('🎬 Setting up H.264 MSE mode...');
+                this.canvas.style.display = 'none';
+                this.webrtcVideo.style.display = 'none';
+                if (this.h264Video) this.h264Video.style.display = 'block';
+                // Reuse the touch overlay (same layout as canvas mode) for input.
+                if (this.touchOverlay) this.touchOverlay.style.pointerEvents = 'auto';
+                console.log('👀 H.264 video shown, overlay enabled for pointer events');
+                await this.connectH264MSE(wsUrls.video_h264);
             } else {
                 console.log('📡 Setting up WebSocket mode...');
                 // Show canvas, hide WebRTC video, and enable overlay events
                 this.canvas.style.display = 'block';
                 this.webrtcVideo.style.display = 'none';
+                if (this.h264Video) this.h264Video.style.display = 'none';
                 if (this.touchOverlay) this.touchOverlay.style.pointerEvents = 'auto';
                 console.log('👀 WebRTC video hidden, canvas shown, overlay enabled for pointer events');
                 // Connect to video WebSocket
                 await this.connectWebSocket('video', wsUrls.video);
             }
-            
+
             // Connect to control WebSocket
             console.log(`🔗 Connecting to control WebSocket: ${wsUrls.control}`);
             await this.connectWebSocket('control', wsUrls.control);
-            
+
             this.isConnected = true;
             this.updateConnectionStatus('connected');
             this.showDeviceContainer();
-            
+
             // Re-setup event listeners after connection (in case canvas wasn't ready before)
             this.setupCanvasEventListeners();
-            
+
         } catch (error) {
             console.error('Connection error:', error);
             this.showError(`Connection failed: ${error.message}`);
             this.updateConnectionStatus('error');
         }
     }
-    
+
     connectWebSocket(type, url) {
         return new Promise((resolve, reject) => {
             const ws = new WebSocket(url);
             let resolved = false;
-            
+
             ws.onopen = () => {
                 console.log(`✅ ${type} WebSocket connected successfully`);
                 this.websockets[type] = ws;
@@ -342,15 +365,15 @@ class IOSBridgeRenderer {
                     resolve();
                 }
             };
-            
+
             ws.onmessage = (event) => {
                 this.handleWebSocketMessage(type, event.data);
             };
-            
+
             ws.onclose = () => {
                 console.log(`🔌 ${type} WebSocket closed`);
                 delete this.websockets[type];
-                
+
                 if (this.isConnected) {
                     console.log(`🔄 Attempting to reconnect ${type} WebSocket in 3 seconds...`);
                     // Try to reconnect after a delay
@@ -361,7 +384,7 @@ class IOSBridgeRenderer {
                     }, 3000);
                 }
             };
-            
+
             ws.onerror = (error) => {
                 console.error(`❌ ${type} WebSocket error:`, error);
                 if (!resolved) {
@@ -369,9 +392,9 @@ class IOSBridgeRenderer {
                     reject(new Error(`${type} WebSocket connection failed`));
                 }
             };
-            
+
             this.websockets[type] = ws;
-            
+
             // Timeout after 10 seconds
             setTimeout(() => {
                 if (!resolved) {
@@ -381,40 +404,43 @@ class IOSBridgeRenderer {
             }, 10000);
         });
     }
-    
+
     disconnect() {
         this.isConnected = false;
-        
+
         Object.entries(this.websockets).forEach(([type, ws]) => {
             if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
                 ws.close();
             }
         });
-        
+
         this.websockets = {};
-        
+
         // Close WebRTC connection
         if (this.peerConnection) {
             this.peerConnection.close();
             this.peerConnection = null;
         }
+
+        // Tear down MSE pipeline (no-op if not active)
+        this.cleanupMSE();
     }
-    
+
     setupWebRTCEventListeners() {
         if (!this.webrtcVideo) return;
-        
+
         // Remove existing listeners first to avoid duplicates
         this.webrtcVideo.removeEventListener('mousedown', this.handleWebRTCTouchStart);
         this.webrtcVideo.removeEventListener('mousemove', this.handleWebRTCTouchMove);
         this.webrtcVideo.removeEventListener('mouseup', this.handleWebRTCTouchEnd);
         // Also remove potential previous resize listener
         this.webrtcVideo.removeEventListener('resize', this.handleWebRTCVideoResize);
-        
+
         // Add new listeners
         this.webrtcVideo.addEventListener('mousedown', this.handleWebRTCTouchStart.bind(this));
         this.webrtcVideo.addEventListener('mousemove', this.handleWebRTCTouchMove.bind(this));
         this.webrtcVideo.addEventListener('mouseup', this.handleWebRTCTouchEnd.bind(this));
-        
+
         // Listen for intrinsic video size changes (e.g., rotation)
         this.handleWebRTCVideoResize = async () => {
             try {
@@ -425,10 +451,10 @@ class IOSBridgeRenderer {
             }
         };
         this.webrtcVideo.addEventListener('resize', this.handleWebRTCVideoResize);
-        
+
         this.webrtcVideo.style.cursor = 'crosshair';
     }
-    
+
     async updateWebRTCVideoLayoutFromElement() {
         if (!this.webrtcVideo) return;
         // Update stream dimensions from actual video element
@@ -451,11 +477,181 @@ class IOSBridgeRenderer {
         // Refresh logical device dimensions from backend to ensure mapping correctness
         await this.refreshDeviceDimensions();
     }
-    
+
+    async connectH264MSE(url) {
+        // Tear down any prior MSE state before re-attaching.
+        this.cleanupMSE();
+        if (!this.h264Video) {
+            throw new Error('H.264 video element not found');
+        }
+        const video = this.h264Video;
+
+        if (typeof MediaSource === 'undefined') {
+            throw new Error('MediaSource Extensions are not supported in this environment');
+        }
+
+        // Create MediaSource and attach to the video element first; we open
+        // the WebSocket inside `sourceopen` so the SourceBuffer can be added
+        // immediately when we know the codec MIME from the server.
+        const mediaSource = new MediaSource();
+        const sourceUrl = URL.createObjectURL(mediaSource);
+        this.mseMediaSource = mediaSource;
+        this.mseSourceUrl = sourceUrl;
+        this.mseInitReceived = false;
+        this.msePendingChunks = [];
+        video.src = sourceUrl;
+
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const onOpen = () => {
+                console.log('🎬 MSE sourceopen');
+                let ws;
+                try {
+                    ws = new WebSocket(url);
+                    ws.binaryType = 'arraybuffer';
+                } catch (e) {
+                    if (!settled) { settled = true; reject(e); }
+                    return;
+                }
+                this.websockets['video_h264'] = ws;
+
+                const flushPending = () => {
+                    const sb = this.mseSourceBuffer;
+                    if (!sb || sb.updating) return;
+                    if (this.msePendingChunks.length === 0) return;
+                    const next = this.msePendingChunks.shift();
+                    try {
+                        sb.appendBuffer(next);
+                    } catch (e) {
+                        console.error('appendBuffer error:', e);
+                    }
+                };
+
+                ws.onopen = () => {
+                    console.log('✅ H.264 WebSocket connected');
+                };
+
+                ws.onmessage = (event) => {
+                    if (typeof event.data === 'string') {
+                        // First text message is the codec descriptor.
+                        try {
+                            const msg = JSON.parse(event.data);
+                            if (msg.type === 'init' && msg.mime) {
+                                console.log(`🎥 MSE codec: ${msg.mime}`);
+                                if (!MediaSource.isTypeSupported(msg.mime)) {
+                                    console.warn(`MediaSource reports codec NOT supported: ${msg.mime}; trying anyway`);
+                                }
+                                try {
+                                    const sb = this.mseMediaSource.addSourceBuffer(msg.mime);
+                                    sb.mode = 'sequence';
+                                    sb.addEventListener('updateend', flushPending);
+                                    sb.addEventListener('error', (e) => {
+                                        console.error('SourceBuffer error:', e);
+                                    });
+                                    this.mseSourceBuffer = sb;
+                                    this.mseInitReceived = true;
+                                    if (!settled) { settled = true; resolve(); }
+                                    flushPending();
+                                } catch (e) {
+                                    if (!settled) { settled = true; reject(e); }
+                                }
+                            }
+                        } catch (e) {
+                            console.error('MSE init parse error:', e);
+                        }
+                        return;
+                    }
+                    // Binary fMP4 chunk (init segment first, then media segments).
+                    const chunk = event.data instanceof ArrayBuffer
+                        ? event.data
+                        : (event.data.buffer || event.data);
+                    this.msePendingChunks.push(chunk);
+                    flushPending();
+                };
+
+                ws.onclose = () => {
+                    console.log('🔌 H.264 WebSocket closed');
+                    delete this.websockets['video_h264'];
+                    if (this.isConnected && this.streamMode === 'h264') {
+                        setTimeout(() => {
+                            if (this.isConnected && this.streamMode === 'h264') {
+                                this.connectH264MSE(url).catch(console.error);
+                            }
+                        }, 3000);
+                    }
+                };
+
+                ws.onerror = (err) => {
+                    console.error('❌ H.264 WebSocket error:', err);
+                    if (!settled) { settled = true; reject(new Error('H.264 WebSocket connection failed')); }
+                };
+
+                setTimeout(() => {
+                    if (!settled) { settled = true; reject(new Error('H.264 WebSocket connection timeout')); }
+                }, 10000);
+            };
+            mediaSource.addEventListener('sourceopen', onOpen, { once: true });
+        }).then(() => {
+            video.addEventListener('loadedmetadata', () => {
+                console.log(`📺 H.264 video metadata: ${video.videoWidth}x${video.videoHeight}`);
+                this.streamDimensions = {
+                    width: video.videoWidth || this.streamDimensions.width,
+                    height: video.videoHeight || this.streamDimensions.height,
+                };
+                if (typeof this.updateResolutionDisplay === 'function') {
+                    this.updateResolutionDisplay(this.streamDimensions.width, this.streamDimensions.height);
+                }
+                video.play().catch((e) => console.warn('h264 video play() rejected:', e));
+            }, { once: true });
+        });
+    }
+
+    cleanupMSE() {
+        const ws = this.websockets && this.websockets['video_h264'];
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+            try { ws.close(); } catch (e) { /* ignore */ }
+        }
+        if (this.websockets) delete this.websockets['video_h264'];
+
+        this.msePendingChunks = [];
+
+        if (this.mseSourceBuffer && this.mseMediaSource) {
+            try {
+                if (this.mseMediaSource.readyState === 'open') {
+                    if (this.mseSourceBuffer.updating) {
+                        try { this.mseSourceBuffer.abort(); } catch (e) { /* ignore */ }
+                    }
+                    this.mseMediaSource.removeSourceBuffer(this.mseSourceBuffer);
+                }
+            } catch (e) { /* ignore */ }
+        }
+        this.mseSourceBuffer = null;
+
+        if (this.mseMediaSource) {
+            try {
+                if (this.mseMediaSource.readyState === 'open') {
+                    this.mseMediaSource.endOfStream();
+                }
+            } catch (e) { /* ignore */ }
+            this.mseMediaSource = null;
+        }
+
+        if (this.h264Video) {
+            try { this.h264Video.pause(); } catch (e) { /* ignore */ }
+            try { this.h264Video.removeAttribute('src'); this.h264Video.load(); } catch (e) { /* ignore */ }
+        }
+
+        if (this.mseSourceUrl) {
+            try { URL.revokeObjectURL(this.mseSourceUrl); } catch (e) { /* ignore */ }
+            this.mseSourceUrl = null;
+        }
+        this.mseInitReceived = false;
+    }
+
     async connectWebRTC(webrtcUrl) {
         return new Promise((resolve, reject) => {
             console.log('🚀 Initializing WebRTC connection...');
-            
+
             // Create peer connection with multiple ICE servers for better connectivity
             this.peerConnection = new RTCPeerConnection({
                 iceServers: [
@@ -467,7 +663,7 @@ class IOSBridgeRenderer {
                 ],
                 iceCandidatePoolSize: 10
             });
-            
+
             // Handle incoming video stream
             this.peerConnection.ontrack = (event) => {
                 console.log('✅ WebRTC video track received');
@@ -475,7 +671,7 @@ class IOSBridgeRenderer {
                     this.webrtcVideo.srcObject = event.streams[0];
                     this.webrtcVideo.style.display = 'block';
                     this.canvas.style.display = 'none';
-                    
+
                     // Debug video dimensions when stream starts
                     this.webrtcVideo.addEventListener('loadedmetadata', async () => {
                         console.log(`📺 WebRTC Video Stream Started:`);
@@ -487,12 +683,12 @@ class IOSBridgeRenderer {
 
                         await this.updateWebRTCVideoLayoutFromElement();
                     }, { once: true });
-                    
+
                     // Setup video element event listeners (including resize)
                     this.setupWebRTCEventListeners();
                 }
             };
-            
+
             // Connection state change handler
             this.peerConnection.onconnectionstatechange = () => {
                 console.log(`🔗 WebRTC connection state: ${this.peerConnection.connectionState}`);
@@ -516,7 +712,7 @@ class IOSBridgeRenderer {
 
             // Setup WebRTC signaling WebSocket
             const signalingWs = new WebSocket(webrtcUrl);
-            
+
             // ICE candidate handler - send candidates to server
             this.peerConnection.onicecandidate = (event) => {
                 if (event.candidate) {
@@ -532,10 +728,10 @@ class IOSBridgeRenderer {
                     console.log('🧊 ICE gathering completed');
                 }
             };
-            
+
             signalingWs.onopen = async () => {
                 console.log('📡 WebRTC signaling connected');
-                
+
                 try {
                     // Start the stream
                     console.log('📡 Sending start-stream request');
@@ -545,17 +741,17 @@ class IOSBridgeRenderer {
                         sessionId: this.config?.sessionInfo?.session_id,
                         fps: 30
                     }));
-                    
+
                     // Create offer
                     console.log('🔧 Creating WebRTC offer');
                     const offer = await this.peerConnection.createOffer({
                         offerToReceiveVideo: true,
                         offerToReceiveAudio: false
                     });
-                    
+
                     await this.peerConnection.setLocalDescription(offer);
                     console.log('✅ Local description set');
-                    
+
                     // Send offer to server
                     console.log('📡 Sending WebRTC offer to server');
                     signalingWs.send(JSON.stringify({
@@ -563,18 +759,18 @@ class IOSBridgeRenderer {
                         sdp: offer.sdp
                     }));
                     console.log('✅ WebRTC offer sent');
-                    
+
                 } catch (error) {
                     console.error('❌ WebRTC offer creation error:', error);
                     reject(error);
                 }
             };
-            
+
             signalingWs.onmessage = async (event) => {
                 try {
                     const data = JSON.parse(event.data);
                     console.log(`📡 WebRTC signaling received: ${data.type}`);
-                    
+
                     if (data.type === 'stream-ready') {
                         console.log('🎬 WebRTC stream ready');
                     } else if (data.type === 'answer') {
@@ -603,19 +799,19 @@ class IOSBridgeRenderer {
                     console.error('WebRTC signaling message error:', error);
                 }
             };
-            
+
             signalingWs.onerror = (error) => {
                 console.error('WebRTC signaling error:', error);
                 reject(error);
             };
-            
+
             signalingWs.onclose = () => {
                 console.log('📡 WebRTC signaling disconnected');
             };
-            
+
             // Store signaling WebSocket
             this.websockets.webrtc = signalingWs;
-            
+
             // Handle ICE candidates
             this.peerConnection.onicecandidate = (event) => {
                 if (event.candidate && signalingWs.readyState === WebSocket.OPEN) {
@@ -627,33 +823,33 @@ class IOSBridgeRenderer {
             };
         });
     }
-    
+
     handleWebRTCTouchStart(event) {
         const rect = this.webrtcVideo.getBoundingClientRect();
         const x = event.clientX - rect.left;
         const y = event.clientY - rect.top;
-        
+
         this.dragStart = { x, y };
         this.isDragging = true;
     }
-    
+
     handleWebRTCTouchMove(event) {
         if (!this.isDragging) return;
-        
+
         event.preventDefault();
     }
-    
+
     handleWebRTCTouchEnd(event) {
         if (!this.isDragging) return;
-        
+
         const rect = this.webrtcVideo.getBoundingClientRect();
         const x = event.clientX - rect.left;
         const y = event.clientY - rect.top;
-        
+
         if (this.dragStart) {
             const deltaX = Math.abs(x - this.dragStart.x);
             const deltaY = Math.abs(y - this.dragStart.y);
-            
+
             if (deltaX < 5 && deltaY < 5) {
                 // This was a tap
                 this.handleWebRTCTap(x, y);
@@ -662,31 +858,31 @@ class IOSBridgeRenderer {
                 this.handleWebRTCSwipe(this.dragStart.x, this.dragStart.y, x, y);
             }
         }
-        
+
         this.dragStart = null;
         this.isDragging = false;
     }
-    
+
     handleWebRTCTap(displayX, displayY) {
         // Convert WebRTC video coordinates to device coordinates
         const deviceCoords = this.convertWebRTCToDeviceCoords(displayX, displayY);
         if (!deviceCoords) {
             return;
         }
-        
+
         // Send tap command via control WebSocket
         this.sendDeviceAction('tap', { x: deviceCoords.x, y: deviceCoords.y });
     }
-    
+
     handleWebRTCSwipe(startX, startY, endX, endY) {
         // Convert WebRTC video coordinates to device coordinates
         const startCoords = this.convertWebRTCToDeviceCoords(startX, startY);
         const endCoords = this.convertWebRTCToDeviceCoords(endX, endY);
-        
+
         if (!startCoords || !endCoords) {
             return;
         }
-        
+
         // Send swipe command via control WebSocket (use camelCase keys expected by sender)
         this.sendDeviceAction('swipe', {
             startX: startCoords.x,
@@ -695,45 +891,45 @@ class IOSBridgeRenderer {
             endY: endCoords.y
         });
     }
-    
+
     convertWebRTCToDeviceCoords(displayX, displayY) {
         if (!this.webrtcVideo || this.deviceDimensions.width === 0 || this.deviceDimensions.height === 0) {
             return null;
         }
-        
+
         // Get element display size
         const elemW = this.webrtcVideo.clientWidth || this.webrtcVideo.offsetWidth;
         const elemH = this.webrtcVideo.clientHeight || this.webrtcVideo.offsetHeight;
         const vidW = this.webrtcVideo.videoWidth || this.streamDimensions.width;
         const vidH = this.webrtcVideo.videoHeight || this.streamDimensions.height;
-        
+
         if (!elemW || !elemH || !vidW || !vidH) return null;
-        
+
         // Account for object-fit: contain letterboxing by computing actual rendered content box
         const scale = Math.min(elemW / vidW, elemH / vidH);
         const contentW = vidW * scale;
         const contentH = vidH * scale;
         const offsetX = (elemW - contentW) / 2;
         const offsetY = (elemH - contentH) / 2;
-        
+
         // Map display coords (relative to element) into content coords
         const inContentX = displayX - offsetX;
         const inContentY = displayY - offsetY;
-        
+
         // Normalize to [0,1]
         const nx = Math.max(0, Math.min(1, inContentX / contentW));
         const ny = Math.max(0, Math.min(1, inContentY / contentH));
-        
+
         // Convert to logical device coordinates
         const deviceX = Math.round(nx * this.deviceDimensions.width);
         const deviceY = Math.round(ny * this.deviceDimensions.height);
-        
+
         // Debug
         console.log(`🎯 WebRTC map -> elem ${elemW}x${elemH}, video ${vidW}x${vidH}, content ${Math.round(contentW)}x${Math.round(contentH)}, offset ${Math.round(offsetX)},${Math.round(offsetY)}, display ${Math.round(displayX)},${Math.round(displayY)} => device ${deviceX},${deviceY} (points ${this.deviceDimensions.width}x${this.deviceDimensions.height})`);
-        
+
         return { x: deviceX, y: deviceY };
     }
-    
+
     async refreshDeviceDimensions() {
         try {
             const sessionId = this.config?.sessionId;
@@ -752,47 +948,56 @@ class IOSBridgeRenderer {
             console.warn('Failed to refresh device dimensions:', e);
         }
     }
-    
+
     toggleStreamMode() {
         const oldMode = this.streamMode;
-        this.streamMode = this.streamMode === 'websocket' ? 'webrtc' : 'websocket';
-        
+        // Cycle: websocket -> webrtc -> h264 -> websocket
+        const nextMode = {
+            websocket: 'webrtc',
+            webrtc: 'h264',
+            h264: 'websocket',
+        };
+        this.streamMode = nextMode[this.streamMode] || 'websocket';
+        const modeLabel = { websocket: 'WebSocket', webrtc: 'WebRTC', h264: 'H.264' };
+        const label = modeLabel[this.streamMode];
+
         console.log(`🔄 Switching stream mode from ${oldMode} to: ${this.streamMode}`);
-        
+
         // Update UI immediately
         const streamModeLabel = document.getElementById('stream-mode-label');
         const streamModeBtn = document.getElementById('stream-mode-btn');
         const streamModeIndicator = document.getElementById('stream-mode-indicator');
-        
+
         if (streamModeLabel) {
-            streamModeLabel.textContent = this.streamMode === 'webrtc' ? 'WebRTC' : 'WebSocket';
+            streamModeLabel.textContent = label;
             console.log(`✅ Updated UI label to: ${streamModeLabel.textContent}`);
         }
-        
+
         if (streamModeBtn) {
+            streamModeBtn.classList.remove('webrtc-mode', 'h264-mode');
             if (this.streamMode === 'webrtc') {
                 streamModeBtn.classList.add('webrtc-mode');
-                console.log('🟠 Added webrtc-mode class to button');
-            } else {
-                streamModeBtn.classList.remove('webrtc-mode');
-                console.log('🔵 Removed webrtc-mode class from button');
+            } else if (this.streamMode === 'h264') {
+                streamModeBtn.classList.add('h264-mode');
             }
         }
-        
+
         // Update footer stream mode indicator
         if (streamModeIndicator) {
-            streamModeIndicator.textContent = this.streamMode === 'webrtc' ? 'WebRTC' : 'WebSocket';
-            streamModeIndicator.className = this.streamMode === 'webrtc' ? 'webrtc' : 'websocket';
+            streamModeIndicator.textContent = label;
+            streamModeIndicator.className = this.streamMode;
             console.log(`✅ Updated footer indicator to: ${streamModeIndicator.textContent}`);
         }
-        
+
         // Show visual feedback about the mode switch
         if (this.streamMode === 'webrtc') {
             this.showStatus('🚀 Switching to WebRTC mode - Lower latency, real-time streaming', 3000);
+        } else if (this.streamMode === 'h264') {
+            this.showStatus('🎬 Switching to H.264 mode - Native fMP4 over WebSocket', 3000);
         } else {
             this.showStatus('📡 Switching to WebSocket mode - High quality screenshots', 3000);
         }
-        
+
         // Reconnect with new mode
         if (this.isConnected) {
             console.log('🔄 Reconnecting with new stream mode...');
@@ -802,11 +1007,11 @@ class IOSBridgeRenderer {
             }, 1000);
         }
     }
-    
+
     refreshStream() {
         console.log('🔄 Refreshing stream connection...');
         this.showStatus('🔄 Refreshing stream...', 2000);
-        
+
         if (this.isConnected) {
             this.disconnect();
             setTimeout(() => {
@@ -823,17 +1028,17 @@ class IOSBridgeRenderer {
             });
         }
     }
-    
+
     showStatus(message, duration = 2000) {
         // Show status message in the UI
         console.log(`📢 Status: ${message}`);
         // You can add visual status display here if needed
     }
-    
+
     handleWebSocketMessage(type, data) {
         try {
             const message = JSON.parse(data);
-            
+
             if (type === 'video' && message.type === 'video_frame') {
                 this.handleVideoFrame(message);
             }
@@ -842,16 +1047,16 @@ class IOSBridgeRenderer {
             console.error(`Error handling ${type} message:`, error);
         }
     }
-    
+
     handleVideoFrame(frameData) {
         if (!this.canvas || !this.ctx) {
             return;
         }
-        
+
         try {
             // Update FPS counter
             this.updateFpsCounter();
-            
+
             // Update logical device point dimensions if present
             if (frameData.point_width && frameData.point_height &&
                 !isNaN(frameData.point_width) && !isNaN(frameData.point_height) &&
@@ -862,7 +1067,7 @@ class IOSBridgeRenderer {
                 };
                 // console.log(`Updated device point dimensions: ${this.deviceDimensions.width}x${this.deviceDimensions.height}`);
             }
-            
+
             // Create image from base64 data
             const img = new Image();
             img.onload = () => {
@@ -879,30 +1084,30 @@ class IOSBridgeRenderer {
                         })
                         .catch(err => console.error('resizeWindow error:', err));
                 }
-                
+
                 // Resize backing canvas buffer if needed (kept at raw px for fidelity)
                 if (this.canvas.width !== img.width || this.canvas.height !== img.height) {
                     this.resizeCanvas(img.width, img.height);
                 }
-                
+
                 // Draw the frame
                 this.ctx.drawImage(img, 0, 0);
-                
+
                 // Update resolution display
                 this.updateResolutionDisplay(img.width, img.height);
             };
-            
+
             img.onerror = (error) => {
                 console.error('Image load error:', error);
             };
-            
+
             img.src = `data:image/jpeg;base64,${frameData.data}`;
-            
+
         } catch (error) {
             console.error('Error handling video frame:', error);
         }
     }
-    
+
     applyScaledCssSize(contentWidth, contentHeight) {
         if (!contentWidth || !contentHeight) return;
         // Canvas CSS size
@@ -918,71 +1123,71 @@ class IOSBridgeRenderer {
             this.touchOverlay.style.height = `${contentHeight}px`;
         }
     }
-    
+
     updateOrientationClass() {
         const isLandscape = this.streamDimensions.width > this.streamDimensions.height;
         document.body.classList.toggle('landscape', isLandscape);
     }
-    
+
     resizeCanvas(width, height) {
         if (!width || !height || isNaN(width) || isNaN(height) || width <= 0 || height <= 0) {
             console.error(`Invalid canvas dimensions: ${width}x${height}`);
             return;
         }
-        
+
         // Backing store size in pixels
         this.canvas.width = width;
         this.canvas.height = height;
         this.canvasDimensions = { width, height };
-        
+
         // CSS size is managed based on main process applied scale in handleVideoFrame/init
-        
+
         // Re-setup event listeners after resize
         this.setupCanvasEventListeners();
     }
-    
+
     handleTouchStart(e) {
         e.preventDefault();
-        
+
         const rect = this.canvas.getBoundingClientRect();
         const clickX = e.clientX - rect.left;
         const clickY = e.clientY - rect.top;
-        
+
         this.isDragging = false;
         this.dragStart = { x: clickX, y: clickY };
         this.canvas.style.cursor = 'grabbing';
     }
-    
+
     handleTouchMove(e) {
         e.preventDefault();
-        
+
         if (!this.dragStart) return;
-        
+
         const rect = this.canvas.getBoundingClientRect();
         const currentX = e.clientX - rect.left;
         const currentY = e.clientY - rect.top;
-        
+
         const deltaX = currentX - this.dragStart.x;
         const deltaY = currentY - this.dragStart.y;
         const distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
-        
+
         // If moved more than 5 pixels, consider it a drag
         if (distance > 5) {
             this.isDragging = true;
         }
     }
-    
+
     handleTouchEnd(e) {
         e.preventDefault();
-        
+
         if (!this.dragStart) return;
-        
+
         const rect = this.canvas.getBoundingClientRect();
         const endX = e.clientX - rect.left;
         const endY = e.clientY - rect.top;
-        
+
         this.canvas.style.cursor = 'crosshair';
-        
+
         if (this.isDragging) {
             // Handle swipe/drag
             this.handleSwipe(this.dragStart.x, this.dragStart.y, endX, endY);
@@ -990,69 +1195,69 @@ class IOSBridgeRenderer {
             // Handle tap
             this.handleTap(this.dragStart.x, this.dragStart.y);
         }
-        
+
         this.dragStart = null;
         this.isDragging = false;
     }
-    
+
     convertDisplayToDeviceCoords(displayX, displayY) {
         if (!this.canvas || this.deviceDimensions.width === 0 || this.deviceDimensions.height === 0) {
             return null;
         }
-        
+
         // Get the actual displayed size of the canvas (CSS size)
         const displayWidth = this.canvas.clientWidth || this.canvas.offsetWidth || this.streamDimensions.width;
         const displayHeight = this.canvas.clientHeight || this.canvas.offsetHeight || this.streamDimensions.height;
-        
+
         // Convert to device coordinates based on logical point dimensions from video frame
         const deviceX = Math.round((displayX / displayWidth) * this.deviceDimensions.width);
         const deviceY = Math.round((displayY / displayHeight) * this.deviceDimensions.height);
-        
+
         // Debug: console.log(`Canvas: Display(${displayX}, ${displayY}) -> Device(${deviceX}, ${deviceY})`);
-        
+
         return { x: deviceX, y: deviceY };
     }
-    
+
     handleTap(displayX, displayY) {
         // Convert display coordinates to device coordinates
         const deviceCoords = this.convertDisplayToDeviceCoords(displayX, displayY);
         if (!deviceCoords) {
             return;
         }
-        
+
         // Send tap command via control WebSocket
         this.sendDeviceAction('tap', { x: deviceCoords.x, y: deviceCoords.y });
-        
+
         // Show visual feedback
         this.showTouchFeedback(displayX, displayY);
     }
-    
+
     handleSwipe(startX, startY, endX, endY) {
         // Convert coordinates
         const startCoords = this.convertDisplayToDeviceCoords(startX, startY);
         const endCoords = this.convertDisplayToDeviceCoords(endX, endY);
-        
+
         if (!startCoords || !endCoords) return;
-        
+
         // Send swipe command
-        this.sendDeviceAction('swipe', { 
-            startX: startCoords.x, 
-            startY: startCoords.y, 
-            endX: endCoords.x, 
-            endY: endCoords.y 
+        this.sendDeviceAction('swipe', {
+            startX: startCoords.x,
+            startY: startCoords.y,
+            endX: endCoords.x,
+            endY: endCoords.y
         });
     }
-    
+
     handleKeyDown(e) {
         // Only handle keyboard shortcuts when not in keyboard input mode or when input is not focused
         const keyboardInput = document.getElementById('keyboard-input');
         const isInputFocused = document.activeElement === keyboardInput;
-        
+
         // If keyboard mode is active and input is focused, let normal typing work
         if (this.keyboardMode && isInputFocused) {
             return;
         }
-        
+
         // Handle global keyboard shortcuts
         switch (e.key) {
             case 'F1':
@@ -1093,34 +1298,34 @@ class IOSBridgeRenderer {
                 break;
         }
     }
-    
+
     sendDeviceAction(type, data) {
         console.log(`🔍 Attempting to send device action: ${type}`, data);
         console.log(`🔍 Available WebSockets:`, Object.keys(this.websockets));
-        
+
         const controlWs = this.websockets.control;
         console.log(`🔍 Control WebSocket:`, controlWs);
         console.log(`🔍 Control WebSocket ReadyState:`, controlWs?.readyState);
         console.log(`🔍 WebSocket.OPEN constant:`, WebSocket.OPEN);
-        
+
         if (!controlWs || controlWs.readyState !== WebSocket.OPEN) {
             console.error(`❌ Control WebSocket not available. Type: ${type}, ReadyState: ${controlWs?.readyState}`);
             console.error(`❌ WebSocket states: CONNECTING=${WebSocket.CONNECTING}, OPEN=${WebSocket.OPEN}, CLOSING=${WebSocket.CLOSING}, CLOSED=${WebSocket.CLOSED}`);
             return;
         }
-        
+
         let message;
-        
+
         switch (type) {
             case 'tap':
                 message = { t: 'tap', x: data.x, y: data.y };
                 break;
             case 'swipe':
-                message = { 
-                    t: 'swipe', 
-                    start_x: data.startX, 
-                    start_y: data.startY, 
-                    end_x: data.endX, 
+                message = {
+                    t: 'swipe',
+                    start_x: data.startX,
+                    start_y: data.startY,
+                    end_x: data.endX,
                     end_y: data.endY,
                     duration: data.duration || 0.3
                 };
@@ -1140,11 +1345,11 @@ class IOSBridgeRenderer {
             default:
                 message = { t: type, ...data };
         }
-        
+
         const messageString = JSON.stringify(message);
         console.log(`✅ Sending WebSocket message:`, message);
         console.log(`✅ Message string:`, messageString);
-        
+
         try {
             controlWs.send(messageString);
             console.log(`✅ WebSocket message sent successfully`);
@@ -1152,7 +1357,7 @@ class IOSBridgeRenderer {
             console.error(`❌ Error sending WebSocket message:`, error);
         }
     }
-    
+
     handleDeviceAction(action) {
         switch (action) {
             case 'home':
@@ -1187,19 +1392,19 @@ class IOSBridgeRenderer {
                 break;
         }
     }
-    
+
     setQuality(quality) {
         this.currentQuality = quality;
         this.updateQualityDisplay();
     }
-    
+
     updateQualityDisplay() {
         const items = document.querySelectorAll('#quality-menu .dropdown-item');
         items.forEach(item => {
             item.classList.toggle('active', item.dataset.quality === this.currentQuality);
         });
     }
-    
+
     async takeScreenshot() {
         const canvas = this.canvas;
         if (canvas) {
@@ -1208,16 +1413,16 @@ class IOSBridgeRenderer {
                 canvas.style.filter = '';
             }, 200);
         }
-        
+
         // Get the session ID from config
         const sessionId = this.config?.sessionId;
         const serverUrl = this.config?.serverUrl;
-        
+
         if (!sessionId || !serverUrl) {
             console.error('Missing session ID or server URL for screenshot');
             return;
         }
-        
+
         try {
             // Call the screenshot API endpoint
             const response = await fetch(`${serverUrl}/api/sessions/${sessionId}/screenshot/download`, {
@@ -1226,7 +1431,7 @@ class IOSBridgeRenderer {
                     'Content-Type': 'application/json',
                 }
             });
-            
+
             if (response.ok) {
                 // Get the filename from Content-Disposition header or create one
                 const contentDisposition = response.headers.get('Content-Disposition');
@@ -1237,10 +1442,10 @@ class IOSBridgeRenderer {
                         filename = filenameMatch[1].replace(/"/g, ''); // Remove quotes
                     }
                 }
-                
+
                 // Get the blob data
                 const blob = await response.blob();
-                
+
                 // Create a download link and trigger download
                 const url = window.URL.createObjectURL(blob);
                 const a = document.createElement('a');
@@ -1249,11 +1454,11 @@ class IOSBridgeRenderer {
                 a.download = filename;
                 document.body.appendChild(a);
                 a.click();
-                
+
                 // Clean up
                 window.URL.revokeObjectURL(url);
                 document.body.removeChild(a);
-                
+
                 console.log(`Screenshot saved as ${filename}`);
             } else {
                 console.error('Failed to take screenshot:', response.statusText);
@@ -1262,20 +1467,20 @@ class IOSBridgeRenderer {
             console.error('Error taking screenshot:', error);
         }
     }
-    
+
     async showDeviceInfo() {
         const modal = document.getElementById('info-modal');
         const modalBody = document.getElementById('info-modal-body');
-        
+
         if (!modal || !modalBody) return;
-        
+
         // Get session info and device dimensions
         const sessionInfo = this.config?.sessionInfo || {};
         const deviceType = sessionInfo.device_type || 'Unknown Device';
         const iosVersion = sessionInfo.ios_version || 'Unknown';
         const sessionId = this.config?.sessionId || 'Unknown';
         const serverUrl = this.config?.serverUrl || 'Unknown';
-        
+
         // Create device info table
         modalBody.innerHTML = `
             <table class="info-table">
@@ -1317,72 +1522,72 @@ class IOSBridgeRenderer {
                 </tr>
             </table>
         `;
-        
+
         // Show modal
         modal.classList.add('show');
     }
-    
+
     closeModal() {
         const modal = document.getElementById('info-modal');
         modal?.classList.remove('show');
     }
-    
+
     updateFpsCounter() {
         this.fpsCounter++;
         const now = Date.now();
-        
+
         if (now - this.lastFpsUpdate >= 1000) {
             const fpsElement = document.getElementById('fps-counter');
             if (fpsElement) {
                 fpsElement.textContent = `FPS: ${this.fpsCounter}`;
             }
-            
+
             this.fpsCounter = 0;
             this.lastFpsUpdate = now;
         }
     }
-    
+
     updateResolutionDisplay(width, height) {
         const resElement = document.getElementById('resolution');
         if (resElement) {
             resElement.textContent = `Resolution: ${width}x${height}`;
         }
     }
-    
+
     updateConnectionStatus(status) {
         const statusElement = document.getElementById('connection-status');
         if (statusElement) {
             statusElement.className = `status-${status}`;
         }
     }
-    
+
     showLoading() {
         document.getElementById('loading')?.style.setProperty('display', 'block');
         document.getElementById('device-container')?.style.setProperty('display', 'none');
         document.getElementById('error-container')?.style.setProperty('display', 'none');
     }
-    
+
     showDeviceContainer() {
         document.getElementById('loading')?.style.setProperty('display', 'none');
         document.getElementById('device-container')?.style.setProperty('display', 'flex');
         document.getElementById('error-container')?.style.setProperty('display', 'none');
     }
-    
+
     showError(message) {
         const errorMessage = document.getElementById('error-message');
         if (errorMessage) {
             errorMessage.textContent = message;
         }
-        
+
         document.getElementById('loading')?.style.setProperty('display', 'none');
         document.getElementById('device-container')?.style.setProperty('display', 'none');
         document.getElementById('error-container')?.style.setProperty('display', 'flex');
     }
-    
+
     showTouchFeedback(x, y) {
         // Get canvas position relative to the viewport
         const canvasRect = this.canvas.getBoundingClientRect();
-        
+
         const feedback = document.createElement('div');
         feedback.className = 'touch-point';
         feedback.style.position = 'fixed';
@@ -1397,7 +1602,7 @@ class IOSBridgeRenderer {
         feedback.style.zIndex = '9999';
         feedback.style.transform = 'translate(-50%, -50%)';
         feedback.style.animation = 'touchFeedback 0.3s ease-out';
-        
+
         // Add CSS animation if not already present
         if (!document.getElementById('touch-feedback-styles')) {
             const style = document.createElement('style');
@@ -1411,14 +1616,14 @@ class IOSBridgeRenderer {
             `;
             document.head.appendChild(style);
         }
-        
+
         document.body.appendChild(feedback);
-        
+
         setTimeout(() => {
             feedback.remove();
         }, 300);
     }
-    
+
     // Window control methods
     async minimizeWindow() {
         try {
@@ -1427,7 +1632,7 @@ class IOSBridgeRenderer {
             console.error('Error minimizing window:', error);
         }
     }
-    
+
     async closeWindow() {
         try {
             await window.electronAPI.quitApp();
@@ -1435,14 +1640,14 @@ class IOSBridgeRenderer {
             console.error('Error closing window:', error);
         }
     }
-    
+
     toggleQualityMenu() {
         const qualityMenu = document.getElementById('quality-menu');
         if (qualityMenu) {
             qualityMenu.classList.toggle('show');
         }
     }
-    
+
     // Keyboard functionality methods
     toggleKeyboard() {
         this.keyboardMode = !this.keyboardMode;
@@ -1450,7 +1655,7 @@ class IOSBridgeRenderer {
         const keyboardBtn = document.getElementById('keyboard-btn');
         const keyboardInput = document.getElementById('keyboard-input');
         const mainContent = document.querySelector('.main-content');
-        
+
         if (this.keyboardMode) {
             keyboardSection.style.display = 'block';
             keyboardBtn.classList.add('keyboard-active');
@@ -1467,27 +1672,27 @@ class IOSBridgeRenderer {
             mainContent.classList.remove('keyboard-open');
         }
     }
-    
+
     sendKeyboardText() {
         const keyboardInput = document.getElementById('keyboard-input');
         const text = keyboardInput?.value.trim();
-        
+
         if (!text) return;
-        
+
         console.log(`📝 Sending keyboard text: "${text}"`);
-        
+
         // Send text via control WebSocket
         this.sendDeviceAction('text', { text: text });
-        
+
         // Clear the input
         if (keyboardInput) {
             keyboardInput.value = '';
         }
-        
+
         // Show feedback in footer
         this.showTemporaryMessage(`Text sent: "${text}"`);
     }
-    
+
     clearKeyboardText() {
         const keyboardInput = document.getElementById('keyboard-input');
         if (keyboardInput) {
@@ -1495,21 +1700,21 @@ class IOSBridgeRenderer {
             keyboardInput.focus();
         }
     }
-    
+
     showTemporaryMessage(message) {
         const keyboardHint = document.querySelector('.keyboard-hint');
         if (keyboardHint) {
             const originalText = keyboardHint.textContent;
             keyboardHint.textContent = message;
             keyboardHint.style.color = '#007AFF';
-            
+
             setTimeout(() => {
                 keyboardHint.textContent = originalText;
                 keyboardHint.style.color = '#888';
             }, 2000);
         }
     }
-    
+
     // Real-time keyboard functionality
     toggleRealtimeMode(enabled) {
         this.realtimeMode = enabled;
@@ -1517,7 +1722,7 @@ class IOSBridgeRenderer {
         const keyboardInputRow = document.querySelector('.keyboard-input-row');
         const sendBtn = document.getElementById('send-text-btn');
         const keyboardInput = document.getElementById('keyboard-input');
-        
+
         if (enabled) {
             keyboardHint.textContent = '⚡ Real-time mode: Each keystroke is sent immediately to the device';
             keyboardHint.classList.add('realtime-active');
@@ -1532,36 +1737,36 @@ class IOSBridgeRenderer {
             keyboardInput.placeholder = 'Type text to send to device...';
         }
     }
-    
+
     handleRealtimeKeyPress(e) {
         // Prevent the default browser behavior for most keys
         const allowedKeys = ['Tab', 'Escape', 'F1', 'F2', 'F3', 'F4'];
         if (!allowedKeys.includes(e.key)) {
             e.preventDefault();
         }
-        
+
         // Map JavaScript key events to iOS key codes
         const keyCode = this.mapKeyToIOSCode(e.key);
-        
+
         if (keyCode) {
             // Send individual key press to device
             console.log(`Sending key: ${keyCode} for input: ${e.key}`);
             this.sendDeviceAction('key', { key: keyCode });
-            
+
             // Show visual feedback
             this.showRealtimeKeyFeedback(e.key);
         } else {
             console.log(`No mapping found for key: ${e.key}`);
         }
     }
-    
+
     mapKeyToIOSCode(key) {
         // iOS Key codes for idb ui key command
         // These are based on iOS/UIKit key codes and HID usage codes
         const keyMappings = {
             // Letters - using HID usage codes
             'a': '4', 'A': '4',
-            'b': '5', 'B': '5', 
+            'b': '5', 'B': '5',
             'c': '6', 'C': '6',
             'd': '7', 'D': '7',
             'e': '8', 'E': '8',
@@ -1586,18 +1791,18 @@ class IOSBridgeRenderer {
             'x': '27', 'X': '27',
             'y': '28', 'Y': '28',
             'z': '29', 'Z': '29',
-            
+
             // Numbers - HID usage codes
             '1': '30', '2': '31', '3': '32', '4': '33', '5': '34',
             '6': '35', '7': '36', '8': '37', '9': '38', '0': '39',
-            
+
             // Special keys
             'Enter': '40',      // Return
             'Escape': '41',     // Escape
             'Backspace': '42',  // Backspace
             'Tab': '43',        // Tab
             ' ': '44',          // Space
-            
+
             // Punctuation
             '-': '45',          // Minus/Hyphen
             '=': '46',          // Equal
@@ -1610,40 +1815,40 @@ class IOSBridgeRenderer {
             ',': '54',          // Comma
             '.': '55',          // Period
             '/': '56',          // Slash
-            
+
             // Arrow keys
             'ArrowRight': '79', // Right arrow
             'ArrowLeft': '80',  // Left arrow
             'ArrowDown': '81',  // Down arrow
             'ArrowUp': '82',    // Up arrow
-            
+
             // Delete key
             'Delete': '76'      // Delete forward
         };
-        
+
         // Try direct mapping first
         if (keyMappings[key]) {
             return keyMappings[key];
         }
-        
+
         // No fallback - only use mapped keys
         return null;
     }
-    
+
     showRealtimeKeyFeedback(key) {
         const keyboardHint = document.getElementById('keyboard-hint');
         if (keyboardHint) {
             const displayKey = key === ' ' ? 'SPACE' : key === 'Enter' ? 'RETURN' : key;
             keyboardHint.textContent = `⚡ Sent: ${displayKey}`;
             keyboardHint.style.color = '#00ff00';
-            
+
             setTimeout(() => {
                 keyboardHint.textContent = '⚡ Real-time mode: Each keystroke is sent immediately to the device';
                 keyboardHint.style.color = '#007AFF';
             }, 500);
         }
     }
-    
+
     // Swipe gesture functionality
     toggleSwipeMenu() {
         const swipeMenu = document.getElementById('swipe-menu');
@@ -1651,21 +1856,21 @@ class IOSBridgeRenderer {
             swipeMenu.classList.toggle('show');
         }
     }
-    
+
     performSwipeGesture(direction) {
         // Close the menu
         const swipeMenu = document.getElementById('swipe-menu');
         if (swipeMenu) {
             swipeMenu.classList.remove('show');
         }
-        
+
         // Define swipe coordinates based on device dimensions
         const centerX = Math.round(this.deviceDimensions.width / 2);
         const centerY = Math.round(this.deviceDimensions.height / 2);
         const swipeDistance = Math.round(Math.min(this.deviceDimensions.width, this.deviceDimensions.height) * 0.3);
-        
+
         let startX, startY, endX, endY;
-        
+
         switch (direction) {
             case 'up':
                 startX = centerX;
@@ -1694,7 +1899,7 @@ class IOSBridgeRenderer {
             default:
                 return;
         }
-        
+
         console.log(`Performing ${direction} swipe: (${startX}, ${startY}) -> (${endX}, ${endY})`);
         this.sendDeviceAction('swipe', {
             startX: startX,
@@ -1704,22 +1909,22 @@ class IOSBridgeRenderer {
             duration: 0.3
         });
     }
-    
+
     // Video recording functionality
     async startRecording() {
         if (this.isRecording) {
             return;
         }
-        
+
         try {
             const sessionId = this.config?.sessionId;
             const serverUrl = this.config?.serverUrl;
-            
+
             if (!sessionId || !serverUrl) {
                 console.error('Missing session ID or server URL for recording');
                 return;
             }
-            
+
             // Call the recording start API
             const response = await fetch(`${serverUrl}/api/sessions/${sessionId}/recording/start`, {
                 method: 'POST',
@@ -1727,7 +1932,7 @@ class IOSBridgeRenderer {
                     'Content-Type': 'application/json',
                 }
             });
-            
+
             if (response.ok) {
                 this.isRecording = true;
                 this.updateRecordingUI(true);
@@ -1739,21 +1944,21 @@ class IOSBridgeRenderer {
             console.error('Error starting recording:', error);
         }
     }
-    
+
     async stopRecording() {
         if (!this.isRecording) {
             return;
         }
-        
+
         try {
             const sessionId = this.config?.sessionId;
             const serverUrl = this.config?.serverUrl;
-            
+
             if (!sessionId || !serverUrl) {
                 console.error('Missing session ID or server URL for recording');
                 return;
             }
-            
+
             // Call the recording stop API
             const response = await fetch(`${serverUrl}/api/sessions/${sessionId}/recording/stop`, {
                 method: 'POST',
@@ -1761,13 +1966,13 @@ class IOSBridgeRenderer {
                     'Content-Type': 'application/json',
                 }
             });
-            
+
             if (response.ok) {
                 // Get the recording file and trigger download
                 const blob = await response.blob();
                 const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
                 const filename = `ios-recording-${sessionId.substring(0, 8)}-${timestamp}.mp4`;
-                
+
                 // Create download link
                 const url = window.URL.createObjectURL(blob);
                 const a = document.createElement('a');
@@ -1776,11 +1981,11 @@ class IOSBridgeRenderer {
                 a.download = filename;
                 document.body.appendChild(a);
                 a.click();
-                
+
                 // Clean up
                 window.URL.revokeObjectURL(url);
                 document.body.removeChild(a);
-                
+
                 this.isRecording = false;
                 this.updateRecordingUI(false);
                 console.log(`Recording saved as ${filename}`);
@@ -1791,11 +1996,11 @@ class IOSBridgeRenderer {
             console.error('Error stopping recording:', error);
         }
     }
-    
+
     updateRecordingUI(recording) {
         const recordBtn = document.getElementById('record-btn');
         const stopRecordBtn = document.getElementById('stop-record-btn');
-        
+
         if (recording) {
             recordBtn.style.display = 'none';
             recordBtn.classList.add('recording');
@@ -1808,22 +2013,22 @@ class IOSBridgeRenderer {
             stopRecordBtn.classList.remove('recording');
         }
     }
-    
+
     // App Installation functionality
     showAppInstallModal() {
         const modal = document.getElementById('app-install-modal');
         if (!modal) return;
-        
+
         // Reset modal state
         this.resetAppInstallModal();
-        
+
         // Show modal
         modal.classList.add('show');
-        
+
         // Setup modal event listeners
         this.setupAppInstallEventListeners();
     }
-    
+
     resetAppInstallModal() {
         // Reset file selection
         this.selectedFile = null;
@@ -1833,7 +2038,7 @@ class IOSBridgeRenderer {
         const installBtn = document.getElementById('install-btn');
         const installLaunchBtn = document.getElementById('install-launch-btn');
         const progressSection = document.getElementById('install-progress');
-        
+
         if (fileInput) fileInput.value = '';
         if (fileSelected) fileSelected.style.display = 'none';
         if (uploadPlaceholder) uploadPlaceholder.style.display = 'block';
@@ -1841,12 +2046,12 @@ class IOSBridgeRenderer {
         if (installLaunchBtn) installLaunchBtn.disabled = true;
         if (progressSection) progressSection.style.display = 'none';
     }
-    
+
     setupAppInstallEventListeners() {
         // File upload area click
         const fileUploadArea = document.getElementById('file-upload-area');
         const fileInput = document.getElementById('app-file-input');
-        
+
         if (fileUploadArea) {
             fileUploadArea.onclick = async () => {
                 if (window.electronAPI && window.electronAPI.showOpenDialog) {
@@ -1860,24 +2065,24 @@ class IOSBridgeRenderer {
                 }
             };
         }
-        
+
         // File input change (for browser fallback)
         if (fileInput) {
             fileInput.onchange = (e) => this.handleFileSelection(e);
         }
-        
+
         // Install buttons
         const installBtn = document.getElementById('install-btn');
         const installLaunchBtn = document.getElementById('install-launch-btn');
-        
+
         if (installBtn) {
             installBtn.onclick = () => this.installApp(false);
         }
-        
+
         if (installLaunchBtn) {
             installLaunchBtn.onclick = () => this.installApp(true);
         }
-        
+
         // Modal close
         const modal = document.getElementById('app-install-modal');
         if (modal) {
@@ -1888,7 +2093,7 @@ class IOSBridgeRenderer {
             };
         }
     }
-    
+
     async showElectronFileDialog() {
         try {
             const result = await window.electronAPI.showOpenDialog({
@@ -1899,11 +2104,11 @@ class IOSBridgeRenderer {
                 ],
                 properties: ['openFile']
             });
-            
+
             if (!result.canceled && result.filePaths && result.filePaths.length > 0) {
                 const filePath = result.filePaths[0];
                 console.log('Selected file path:', filePath);
-                
+
                 // Read the file using IPC
                 try {
                     const fileResult = await window.electronAPI.readFile(filePath);
@@ -1914,13 +2119,13 @@ class IOSBridgeRenderer {
                         for (let i = 0; i < binaryString.length; i++) {
                             bytes[i] = binaryString.charCodeAt(i);
                         }
-                        
+
                         // Create a File object
                         const blob = new Blob([bytes]);
-                        const file = new File([blob], fileResult.fileName, { 
+                        const file = new File([blob], fileResult.fileName, {
                             type: this.getMimeType(fileResult.fileName)
                         });
-                        
+
                         // Handle the file selection
                         this.handleFileSelectionDirect(file);
                     } else {
@@ -1937,7 +2142,7 @@ class IOSBridgeRenderer {
             alert('Error opening file dialog. Please try again.');
         }
     }
-    
+
     getMimeType(filename) {
         const extension = filename.toLowerCase().split('.').pop();
         switch (extension) {
@@ -1949,40 +2154,40 @@ class IOSBridgeRenderer {
                 return 'application/octet-stream';
         }
     }
-    
+
     handleFileSelectionDirect(file) {
         if (!file) return;
-        
+
         // Validate file type
         const validExtensions = ['.ipa', '.zip'];
         const fileExtension = file.name.toLowerCase().substring(file.name.lastIndexOf('.'));
-        
+
         if (!validExtensions.includes(fileExtension)) {
             alert('Please select a valid .ipa or .zip file');
             return;
         }
-        
+
         // Store the file reference for later use
         this.selectedFile = file;
-        
+
         // Update UI to show selected file
         this.updateFileSelectionUI(file);
     }
-    
-    
+
+
     updateFileSelectionUI(file) {
         const fileSelected = document.getElementById('file-selected');
         const uploadPlaceholder = document.querySelector('.upload-placeholder');
         const selectedFileName = document.getElementById('selected-file-name');
         const installBtn = document.getElementById('install-btn');
         const installLaunchBtn = document.getElementById('install-launch-btn');
-        
+
         if (fileSelected && uploadPlaceholder && selectedFileName) {
             uploadPlaceholder.style.display = 'none';
             fileSelected.style.display = 'flex';
             selectedFileName.textContent = file.name;
         }
-        
+
         // Enable install buttons
         if (installBtn) installBtn.disabled = false;
         if (installLaunchBtn) installLaunchBtn.disabled = false;
@@ -1991,24 +2196,24 @@ class IOSBridgeRenderer {
     handleFileSelection(event) {
         const file = event.target.files[0];
         if (!file) return;
-        
+
         // Validate file type
         const validExtensions = ['.ipa', '.zip'];
         const fileExtension = file.name.toLowerCase().substring(file.name.lastIndexOf('.'));
-        
+
         if (!validExtensions.includes(fileExtension)) {
             alert('Please select a valid .ipa or .zip file');
             event.target.value = '';
             return;
         }
-        
+
         // Store the file reference for later use
         this.selectedFile = file;
-        
+
         // Update UI
         this.updateFileSelectionUI(file);
     }
-    
+
     async installApp(launchAfterInstall = false) {
         // Get file from either stored reference (Electron) or file input (browser)
         let file;
@@ -2018,28 +2223,28 @@ class IOSBridgeRenderer {
             const fileInput = document.getElementById('app-file-input');
             file = fileInput?.files[0];
         }
-        
+
         if (!file) {
             alert('Please select a file first');
             return;
         }
-        
+
         const sessionId = this.config?.sessionId;
         const serverUrl = this.config?.serverUrl;
-        
+
         if (!sessionId || !serverUrl) {
             alert('Missing session information');
             return;
         }
-        
+
         // Show progress
         this.showInstallProgress();
-        
+
         try {
             // Create form data with correct field names based on file type
             const formData = new FormData();
             const fileExtension = file.name.toLowerCase().split('.').pop();
-            
+
             // Determine field name based on file extension
             let fieldName;
             if (fileExtension === 'ipa') {
@@ -2053,97 +2258,97 @@ class IOSBridgeRenderer {
                 fieldName = 'app_bundle';
                 formData.append('app_bundle', file);
             }
-            
+
             // Determine endpoint based on launch option
             const endpoint = launchAfterInstall ? 'install-and-launch' : 'install';
             const url = `${serverUrl}/api/sessions/${sessionId}/apps/${endpoint}`;
-            
+
             console.log(`Installing app via ${endpoint} endpoint with file type: ${fileExtension}, field name: ${fieldName}, file size: ${file.size} bytes`);
             console.log(`URL: ${url}`);
             console.log(`File object:`, file);
-            
+
             // Validate file exists and has content
             if (!file.size || file.size === 0) {
                 throw new Error('Selected file is empty');
             }
-            
+
             // Make request
             const response = await fetch(url, {
                 method: 'POST',
                 body: formData
             });
-            
+
             if (response.ok) {
                 const result = await response.json();
                 console.log('App installation successful:', result);
-                
+
                 // Update progress to completion
                 this.updateInstallProgress(100, launchAfterInstall ? 'App installed and launched successfully!' : 'App installed successfully!');
-                
+
                 // Close modal after delay
                 setTimeout(() => {
                     this.closeAppInstallModal();
                 }, 2000);
-                
+
             } else {
                 const errorText = await response.text();
                 console.error('App installation failed:', response.status, errorText);
                 alert(`Installation failed: ${response.status} - ${errorText}`);
                 this.hideInstallProgress();
             }
-            
+
         } catch (error) {
             console.error('Error installing app:', error);
             alert(`Installation error: ${error.message}`);
             this.hideInstallProgress();
         }
     }
-    
+
     showInstallProgress() {
         const progressSection = document.getElementById('install-progress');
         const installBtn = document.getElementById('install-btn');
         const installLaunchBtn = document.getElementById('install-launch-btn');
-        
+
         if (progressSection) progressSection.style.display = 'block';
         if (installBtn) installBtn.disabled = true;
         if (installLaunchBtn) installLaunchBtn.disabled = true;
-        
+
         // Start progress animation
         this.updateInstallProgress(20, 'Uploading app file...');
-        
+
         setTimeout(() => {
             this.updateInstallProgress(60, 'Installing app on device...');
         }, 1000);
     }
-    
+
     updateInstallProgress(percent, message) {
         const progressFill = document.getElementById('progress-fill');
         const progressText = document.getElementById('progress-text');
-        
+
         if (progressFill) {
             progressFill.style.width = `${percent}%`;
         }
-        
+
         if (progressText) {
             progressText.textContent = message;
         }
     }
-    
+
     hideInstallProgress() {
         const progressSection = document.getElementById('install-progress');
         const installBtn = document.getElementById('install-btn');
         const installLaunchBtn = document.getElementById('install-launch-btn');
         const fileInput = document.getElementById('app-file-input');
-        
+
         if (progressSection) progressSection.style.display = 'none';
-        
+
         // Re-enable buttons if file is selected
         if (fileInput?.files[0]) {
             if (installBtn) installBtn.disabled = false;
             if (installLaunchBtn) installLaunchBtn.disabled = false;
         }
     }
-    
+
     closeAppInstallModal() {
         const modal = document.getElementById('app-install-modal');
         if (modal) {
