@@ -1692,7 +1692,7 @@
         const webrtcVideo = document.getElementById('webrtc-video');
         let currentWebRTCQuality = 'high';
 
-        let currentMode = 'webrtc';
+        let currentMode = 'video';
         let videoWs = null;
         let screenshotWs = null;
         let controlWs = null;
@@ -1901,7 +1901,7 @@
         function init() {
             setupControlWebSocket();
             setupKeyboardShortcuts();
-            switchMode('webrtc');
+            switchMode('video');
             loadInstalledApps();
             loadAppsListState();
             // Initialize logs and location
