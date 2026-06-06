@@ -21,7 +21,6 @@ jupyter_core>=5.8.1
 matplotlib-inline>=0.1.7
 nest-asyncio>=1.6.0
 numpy>=1.24.0
-opencv-python>=4.8.0
 packaging>=25.0
 parso>=0.8.4
 pexpect>=4.9.0

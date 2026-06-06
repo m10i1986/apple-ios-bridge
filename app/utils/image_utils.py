@@ -2,7 +2,6 @@ import base64
 import io
 from PIL import Image
 import numpy as np
-import cv2
 from typing import Dict, Optional
 from app.core.logging import logger
 
