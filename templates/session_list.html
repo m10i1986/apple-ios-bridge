@@ -333,7 +333,7 @@
         }
 
         function openControl(sessionId) {
-            window.open(`/control/${sessionId}`);
+            window.location.href = `/control/${sessionId}`;
         }
 
         async function openAppManagement(sessionId) {
