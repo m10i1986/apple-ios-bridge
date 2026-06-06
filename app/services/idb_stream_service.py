@@ -10,7 +10,6 @@ versions, not stdout, so the screenshot stdout variant is not used.
 """
 
 import base64
-import fcntl
 import io
 import os
 import subprocess
@@ -75,15 +74,18 @@ class IdbStreamService:
     def _try_record_mode(self) -> bool:
         """Try recordVideo + PyAV via a named FIFO. Returns True on success.
 
-        Race-condition-free sequence:
-          1. Open FIFO read end with O_NONBLOCK so it succeeds immediately
-             (no blocking wait for a writer).  This ensures the read end exists
-             before recordVideo tries to open the write end.
-          2. Switch back to blocking mode via fcntl so PyAV reads block normally.
-          3. Launch recordVideo – write-side open succeeds because read end is
-             already established (even for O_WRONLY|O_NONBLOCK writes).
-          4. Pass the pre-opened fd to PyAV in a background thread and wait for
-             the first decoded frame as the success criterion.
+        Mirrors the working `simctl recordVideo ... <fifo> | ffmpeg <fifo>`
+        pattern:
+          1. Create a named FIFO.
+          2. Start a thread that calls av.open(FIFO_PATH).  libav opens the read
+             side natively (blocking) and probes the stream exactly like ffmpeg,
+             which is required to parse the QuickTime/MOV container produced by
+             recordVideo.  (Passing a Python file object instead fails because
+             libav cannot seek/probe a non-seekable wrapper -> AVERROR_INVALIDDATA.)
+          3. Launch recordVideo, whose write-side open rendezvous with the read
+             side.  Blocking opens rendezvous regardless of thread order, so no
+             deadlock can occur.
+          4. Wait for the first decoded frame as the success criterion.
         """
         fifo_path = f"/tmp/ios_bridge_{self.udid}_{os.getpid()}.pipe"
         try:
@@ -94,19 +96,40 @@ class IdbStreamService:
             logger.info(f"IdbStreamService: FIFO creation failed for {self.udid}: {e}")
             return False
 
-        # Open read end immediately with O_NONBLOCK so it does not block waiting
-        # for a writer.  recordVideo's write-side open will then succeed at once.
-        try:
-            rd_fd = os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
-            fl = fcntl.fcntl(rd_fd, fcntl.F_GETFL)
-            fcntl.fcntl(rd_fd, fcntl.F_SETFL, fl & ~os.O_NONBLOCK)  # restore blocking
-        except Exception as e:
-            logger.info(f"IdbStreamService: FIFO read-open failed for {self.udid}: {e}")
-            try: os.unlink(fifo_path)
-            except Exception: pass
-            return False
+        # Start PyAV reader thread using the FIFO PATH so libav handles the pipe
+        # natively (same as ffmpeg).  The OS open() blocks until recordVideo
+        # connects the write side.
+        av_result: Dict = {}
+        av_ready = threading.Event()
 
-        # Launch recordVideo – read end is already open so write open succeeds.
+        def _open_av():
+            try:
+                container = av.open(
+                    fifo_path,
+                    mode="r",
+                    format="mov",
+                    options={
+                        "fflags": "+nobuffer+discardcorrupt+igndts",
+                        "flags": "+low_delay",
+                        "probesize": "5000000",
+                        "analyzeduration": "5000000",
+                    },
+                )
+                for frame in container.decode(video=0):
+                    av_result["container"] = container
+                    av_result["first_frame"] = frame
+                    break
+            except Exception as e:
+                av_result["error"] = e
+                logger.info(f"IdbStreamService: PyAV open error for {self.udid}: {e}")
+            finally:
+                av_ready.set()
+
+        av_thread = threading.Thread(target=_open_av, daemon=True)
+        av_thread.start()
+
+        # Launch recordVideo (writer).  Its write-side open rendezvous with the
+        # reader opened by av.open above.
         try:
             proc = subprocess.Popen(
                 ["xcrun", "simctl", "io", self.udid,
@@ -116,8 +139,6 @@ class IdbStreamService:
             )
         except Exception as e:
             logger.info(f"IdbStreamService: recordVideo launch failed for {self.udid}: {e}")
-            try: os.close(rd_fd)
-            except Exception: pass
             try: os.unlink(fifo_path)
             except Exception: pass
             return False
@@ -132,42 +153,6 @@ class IdbStreamService:
                 pass
 
         threading.Thread(target=_drain_stderr, daemon=True).start()
-
-        # Open PyAV using the pre-opened fd (wrapped as a file object).
-        av_result: Dict = {}
-        av_ready = threading.Event()
-
-        def _open_av():
-            file_obj = None
-            try:
-                file_obj = os.fdopen(rd_fd, "rb")
-                container = av.open(
-                    file_obj,
-                    options={
-                        "fflags": "+nobuffer+discardcorrupt",
-                        "flags": "+low_delay",
-                        "probesize": "131072",
-                        "analyzeduration": "1000000",
-                    },
-                )
-                for frame in container.decode(video=0):
-                    av_result["container"] = container
-                    av_result["first_frame"] = frame
-                    break
-            except Exception as e:
-                av_result["error"] = e
-                logger.info(f"IdbStreamService: PyAV open error for {self.udid}: {e}")
-                if file_obj is not None:
-                    try: file_obj.close()
-                    except Exception: pass
-                else:
-                    try: os.close(rd_fd)
-                    except Exception: pass
-            finally:
-                av_ready.set()
-
-        av_thread = threading.Thread(target=_open_av, daemon=True)
-        av_thread.start()
 
         # Wait for first decoded frame (primary success criterion).
         if not av_ready.wait(timeout=self.RECORD_START_TIMEOUT):
