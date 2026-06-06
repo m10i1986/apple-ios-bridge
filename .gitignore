@@ -26,3 +26,5 @@ nativebridge-ios-poc.ipynb
 engineering-story.md
 
 .env
+
+!start-server.sh
