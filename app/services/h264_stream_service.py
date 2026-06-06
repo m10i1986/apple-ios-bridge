@@ -20,6 +20,7 @@ import fcntl
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -80,6 +81,7 @@ class H264StreamService:
         self._clients_lock = threading.Lock()
         self._clients: Set = set()  # type: ignore[type-arg]
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._keepalive_w_fd: Optional[int] = None  # write-end keepalive on FIFO
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -128,10 +130,10 @@ class H264StreamService:
             return False
         self._fifo_path = fifo_path
 
-        # Open read-end without blocking.
+        # Open read-end without blocking (O_NONBLOCK: succeeds even with no writer).
         try:
             r_fd = os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
-            # Switch to blocking mode: reads should wait for data, not return EAGAIN.
+            # Switch to blocking mode: subsequent reads block until data arrives.
             flags = fcntl.fcntl(r_fd, fcntl.F_GETFL)
             fcntl.fcntl(r_fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
         except Exception as e:
@@ -141,10 +143,24 @@ class H264StreamService:
             self._cleanup_processes()
             return False
 
+        # Open write-end keepalive (O_NONBLOCK: succeeds because r_fd is already
+        # a reader).  POSIX: read() on a pipe with NO writers returns 0 (EOF)
+        # immediately, even in blocking mode.  Keeping this write-end open ensures
+        # ffmpeg's reads block waiting for real data instead of returning EOF
+        # before simctl has connected.  Closed in _cleanup_processes().
+        try:
+            keepalive_w_fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+        except Exception as e:
+            logger.error(
+                f"H264StreamService: FIFO write-end keepalive open failed for {self.udid}: {e}"
+            )
+            os.close(r_fd)
+            self._cleanup_processes()
+            return False
+        self._keepalive_w_fd = keepalive_w_fd
+
         # Start simctl with --force so it skips the "file already exists" check.
-        # r_fd being open means simctl's open(fifo_path, O_WRONLY) won't block.
-        # If --force causes simctl to unlink+recreate the FIFO as a regular file,
-        # ffmpeg still reads from the original inode via r_fd (pass_fds).
+        # r_fd + keepalive_w_fd being open means simctl's O_WRONLY open won't block.
         try:
             self._simctl = subprocess.Popen(
                 ["xcrun", "simctl", "io", self.udid,
@@ -160,8 +176,25 @@ class H264StreamService:
             self._cleanup_processes()
             return False
 
+        # Diagnostic: check if simctl --force replaced our FIFO with a regular file.
+        time.sleep(0.3)
+        try:
+            st = os.stat(fifo_path)
+            if stat.S_ISFIFO(st.st_mode):
+                logger.info(f"H264StreamService: FIFO intact after simctl start for {self.udid}")
+            else:
+                logger.warning(
+                    f"H264StreamService: simctl replaced FIFO with regular file for {self.udid} "
+                    f"(mode={oct(st.st_mode)}) — data will not reach ffmpeg"
+                )
+        except FileNotFoundError:
+            logger.warning(
+                f"H264StreamService: FIFO path removed by simctl --force for {self.udid}"
+            )
+
         # Start ffmpeg with r_fd passed via pass_fds.
         # pipe:{r_fd} tells ffmpeg to read from the fd directly (no open() call).
+        # keepalive_w_fd being open guarantees no premature EOF on r_fd.
         try:
             self._ffmpeg = subprocess.Popen(
                 [
@@ -272,6 +305,13 @@ class H264StreamService:
             except Exception:
                 pass
             self._ffmpeg = None
+
+        if self._keepalive_w_fd is not None:
+            try:
+                os.close(self._keepalive_w_fd)
+            except Exception:
+                pass
+            self._keepalive_w_fd = None
 
         if self._fifo_path:
             try:
