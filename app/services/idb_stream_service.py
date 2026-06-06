@@ -72,7 +72,14 @@ class IdbStreamService:
     # ------------------------------------------------------------------
 
     def _try_record_mode(self) -> bool:
-        """Try recordVideo + PyAV via a named FIFO. Returns True on success."""
+        """Try recordVideo + PyAV via a named FIFO. Returns True on success.
+
+        IMPORTANT: PyAV must open the FIFO for reading BEFORE (or simultaneously
+        with) recordVideo opening it for writing.  A FIFO blocks both sides until
+        the other end is present, so starting PyAV only after "Recording started"
+        creates a deadlock: recordVideo cannot write (and therefore cannot emit
+        "Recording started") until someone reads the FIFO.
+        """
         fifo_path = f"/tmp/ios_bridge_{self.udid}_{os.getpid()}.pipe"
         try:
             if os.path.exists(fifo_path):
@@ -82,48 +89,9 @@ class IdbStreamService:
             logger.debug(f"FIFO creation failed for {self.udid}: {e}")
             return False
 
-        try:
-            proc = subprocess.Popen(
-                ["xcrun", "simctl", "io", self.udid,
-                 "recordVideo", "--codec=h264", "--force", fifo_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-        except Exception as e:
-            logger.debug(f"recordVideo launch failed for {self.udid}: {e}")
-            try: os.unlink(fifo_path)
-            except Exception: pass
-            return False
-
-        # Wait for "Recording started" on stderr
-        started_evt = threading.Event()
-
-        def _drain_stderr():
-            try:
-                for line in proc.stderr:
-                    text = line.decode(errors="replace").strip()
-                    logger.debug(f"simctl recordVideo: {text}")
-                    if "Recording started" in text:
-                        started_evt.set()
-            except Exception:
-                pass
-
-        threading.Thread(target=_drain_stderr, daemon=True).start()
-
-        if not started_evt.wait(timeout=self.RECORD_START_TIMEOUT):
-            logger.debug(f"recordVideo did not emit 'Recording started' within {self.RECORD_START_TIMEOUT}s for {self.udid}")
-            proc.terminate()
-            try: os.unlink(fifo_path)
-            except Exception: pass
-            return False
-
-        if proc.poll() is not None:
-            logger.debug(f"recordVideo process already exited for {self.udid}")
-            try: os.unlink(fifo_path)
-            except Exception: pass
-            return False
-
-        # Try to open FIFO with PyAV (runs in a thread to handle potential blocking)
+        # Start PyAV reader thread FIRST so the FIFO has a reader waiting.
+        # recordVideo's open() on the write side will unblock once this thread
+        # calls av.open(), allowing data to flow and "Recording started" to appear.
         av_result: Dict = {}
         av_ready = threading.Event()
 
@@ -138,7 +106,7 @@ class IdbStreamService:
                         "analyzeduration": "1000000",
                     },
                 )
-                # Try decoding the very first frame to confirm it works
+                # Decode the very first frame to confirm it works
                 for frame in container.decode(video=0):
                     av_result["container"] = container
                     av_result["first_frame"] = frame
@@ -151,6 +119,35 @@ class IdbStreamService:
         av_thread = threading.Thread(target=_open_av, daemon=True)
         av_thread.start()
 
+        try:
+            proc = subprocess.Popen(
+                ["xcrun", "simctl", "io", self.udid,
+                 "recordVideo", "--codec=h264", "--force", fifo_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except Exception as e:
+            logger.debug(f"recordVideo launch failed for {self.udid}: {e}")
+            try: os.unlink(fifo_path)
+            except Exception: pass
+            return False
+
+        # Drain stderr for diagnostics; "Recording started" is a secondary signal
+        started_evt = threading.Event()
+
+        def _drain_stderr():
+            try:
+                for line in proc.stderr:
+                    text = line.decode(errors="replace").strip()
+                    logger.debug(f"simctl recordVideo: {text}")
+                    if "Recording started" in text:
+                        started_evt.set()
+            except Exception:
+                pass
+
+        threading.Thread(target=_drain_stderr, daemon=True).start()
+
+        # Wait for PyAV to obtain the first frame (primary success criterion)
         if not av_ready.wait(timeout=self.RECORD_START_TIMEOUT):
             logger.debug(f"PyAV open/first-frame timed out for {self.udid}")
             proc.terminate()
@@ -161,6 +158,12 @@ class IdbStreamService:
         if "error" in av_result or "container" not in av_result:
             logger.debug(f"PyAV open failed for {self.udid}: {av_result.get('error')}")
             proc.terminate()
+            try: os.unlink(fifo_path)
+            except Exception: pass
+            return False
+
+        if proc.poll() is not None:
+            logger.debug(f"recordVideo process already exited for {self.udid}")
             try: os.unlink(fifo_path)
             except Exception: pass
             return False
