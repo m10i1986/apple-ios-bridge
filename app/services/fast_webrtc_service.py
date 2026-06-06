@@ -301,7 +301,16 @@ class FastWebRTCService:
 
         for connection_id, pc in connections_to_close:
             try:
-                asyncio.create_task(pc.close())
+                loop = asyncio.get_running_loop()
+                loop.create_task(pc.close())
+            except RuntimeError:
+                # Not running inside an event loop (e.g. called from a sync thread);
+                # schedule via the default loop if available.
+                try:
+                    loop = asyncio.get_event_loop()
+                    loop.call_soon_threadsafe(lambda p=pc: loop.create_task(p.close()))
+                except Exception as e:
+                    logger.debug(f"Error scheduling connection close {connection_id}: {e}")
             except Exception as e:
                 logger.debug(f"Error closing connection {connection_id}: {e}")
 

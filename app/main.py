@@ -1,6 +1,7 @@
 import signal
 import atexit
 import time
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -24,11 +25,30 @@ from app.services.connection_manager import connection_manager, managed_connecti
 from app.services.resource_manager import resource_manager
 from app.core.auth import DigestAuthMiddleware
 
+def _asyncio_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """Custom asyncio exception handler.
+
+    Suppresses the known race condition in aioice/stun.py where a STUN
+    transaction retry timer fires after the associated Future has already
+    been resolved or cancelled during WebRTC connection teardown.
+    See: https://github.com/aiortc/aioice/issues - InvalidStateError in __retry
+    """
+    exception = context.get("exception")
+    message = context.get("message", "")
+    if isinstance(exception, asyncio.InvalidStateError) and "Transaction.__retry" in message:
+        logger.debug(f"Suppressed aioice STUN race condition: {exception}")
+        return
+    loop.default_exception_handler(context)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Application starting up...")
     try:
+        # Install custom exception handler to suppress known aioice STUN race condition
+        asyncio.get_event_loop().set_exception_handler(_asyncio_exception_handler)
+
         # Trigger orphaned simulator recovery on startup
         logger.info("Performing orphaned simulator recovery...")
         session_manager._recover_orphaned_simulators()
