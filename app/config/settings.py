@@ -19,7 +19,8 @@ class Settings:
     # UDID will be provided by session management
 
     # Video Configuration
-    DEFAULT_VIDEO_FPS: int = 60
+    DEFAULT_VIDEO_FPS: int = int(os.environ.get("DEFAULT_VIDEO_FPS", "30"))
+    WEBRTC_FPS: int = int(os.environ.get("WEBRTC_FPS", "30"))
     VIDEO_QUEUE_SIZE: int = 3
     WEBRTC_QUEUE_SIZE: int = 2
 
@@ -36,6 +37,12 @@ class Settings:
     # Quality Settings
     DEFAULT_JPEG_QUALITY: int = 80
     WEBRTC_HIGH_QUALITY: int = 95
+
+    # Streaming Resolution & Quality (runtime-adjustable via API)
+    STREAM_SCALE_FACTOR: float = float(os.environ.get("STREAM_SCALE_FACTOR", "1.0"))  # 0.1-1.0
+    STREAM_MAX_WIDTH: int = int(os.environ.get("STREAM_MAX_WIDTH", "0"))    # 0 = unlimited
+    STREAM_MAX_HEIGHT: int = int(os.environ.get("STREAM_MAX_HEIGHT", "0"))  # 0 = unlimited
+    STREAM_JPEG_QUALITY: int = int(os.environ.get("STREAM_JPEG_QUALITY", "75"))  # 10-95
 
     # Timeouts
     SCREENSHOT_TIMEOUT: float = 0.5
