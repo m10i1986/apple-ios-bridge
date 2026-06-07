@@ -38,7 +38,7 @@ from app.core.logging import logger
 
 
 VALID_FORMATS = ("jpeg", "webp")
-DEFAULT_FORMAT = "jpeg"
+DEFAULT_FORMAT = "webp"
 
 
 class ScreenStreamService:
@@ -51,7 +51,7 @@ class ScreenStreamService:
     """
 
     START_TIMEOUT: float = 10.0      # seconds to wait for the first frame
-    CAPTURE_INTERVAL: float = 0.05   # minimum seconds between capture attempts
+    CAPTURE_INTERVAL: float = 0.0    # minimum seconds between captures (0 = full speed)
     MAX_CONSECUTIVE_FAILURES: int = 10
 
     def __init__(self, udid: str, fmt: str = DEFAULT_FORMAT) -> None:

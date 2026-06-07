@@ -1524,8 +1524,8 @@
                     <label style="display:flex;align-items:center;gap:6px;font-size:12px;">
                         画像形式:
                         <select id="screen-format-select" onchange="setScreenFormat(this.value)">
-                            <option value="jpeg" selected>JPEG（軽量）</option>
-                            <option value="webp">WEBP（高画質）</option>
+                            <option value="jpeg">JPEG（軽量）</option>
+                            <option value="webp" selected>WEBP（高画質）</option>
                         </select>
                     </label>
                 </div>
@@ -1715,8 +1715,8 @@
         let videoWs = null;
         let screenshotWs = null;
         let screenWs = null;
-        let screenFormat = 'jpeg';  // 'jpeg' or 'webp' for the screen stream
-        let streamFormatLabel = 'JPEG';  // current frame format shown in the dimension label
+        let screenFormat = 'webp';  // 'jpeg' or 'webp' for the screen stream
+        let streamFormatLabel = 'WEBP';  // current frame format shown in the dimension label
         let controlWs = null;
 
         // WebRTC variables
