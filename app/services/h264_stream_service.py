@@ -1,95 +1,66 @@
-"""H.264 fragmented MP4 broadcaster for iOS simulators.
+"""Screenshot-based screen streaming for iOS simulators.
 
-Pipeline (single process, no external ffmpeg):
-    xcrun simctl io <udid> recordVideo --codec=h264 --force <fifo>
-        -> (FIFO, MOV container with an H.264 elementary stream)
-    PyAV demux(MOV from FIFO) -> PyAV mux(fragmented MP4 to a capturing
-    file-like) -> top-level MP4 boxes parsed and broadcast to WS clients.
+Background: on this simulator host neither ``simctl recordVideo`` nor
+``idb video-stream`` produces a usable real-time stream.  ``simctl recordVideo``
+buffers the whole movie and only writes it on SIGINT (so nothing streams while
+recording), and ``idb video-stream`` yields zero bytes on this environment
+(iOS 17.x simulator, x86_64).  The only reliable real-time capture is
 
-This mirrors the proven IdbStreamService recordVideo pattern, which decodes
-the very same simctl FIFO via PyAV reliably on this host.  The crucial detail
-is that libav opens the FIFO read side natively in a reader THREAD (blocking
-O_RDONLY) and probes the MOV container; simctl --force then connects the write
-side.  Using an in-process PyAV reader (instead of a separate ffmpeg process)
-avoids the FIFO inode race that made the ffmpeg-subprocess approach fail with
-"Interrupted system call".
+    idb screenshot --udid <udid> -
 
-The packets are remuxed (bitstream copy, no transcode) into fragmented MP4 so
-browsers/Electron can play them via Media Source Extensions:
-    - Init segment: ftyp + moov  (cached, re-sent to each new client)
-    - Media segments: moof + mdat  (broadcast to all connected clients)
+which returns exactly one PNG on stdout per invocation.  This service runs that
+capture in a tight background loop and broadcasts each frame to all registered
+WebSocket clients as a JSON message carrying a base64-encoded image.
 
-This module is fully additive and does not modify existing capture paths
-(VideoService / IdbStreamService / FastWebRTCService).
+The output image format is selectable per stream:
+    - "jpeg" (default): smaller, lossy, lower latency / bandwidth.
+    - "png":            lossless, larger.
+
+This module keeps the public surface used by the ``video_h264`` WebSocket
+handler (``get_or_start_service`` / ``release_service_if_idle`` and the
+``add_client`` / ``remove_client`` instance methods) so the endpoint wiring is
+unchanged.
 """
 
 import asyncio
-import os
-import signal
+import base64
+import io
+import json
 import subprocess
 import threading
 import time
 from typing import Dict, Optional, Set
 
-import av # type: ignore
+from PIL import Image
 
+from app.config.settings import settings
 from app.core.logging import logger
 
 
-# Default MSE codec hint sent to clients.  simctl recordVideo --codec=h264
-# typically produces High@4.0 or similar on modern simulators; this string is
-# permissive enough for most browsers and Electron's Chromium build.
-DEFAULT_MSE_MIME = 'video/mp4; codecs="avc1.640032"'
-
-_FRAG_DURATION_US = 100_000  # 100ms fragments for low latency
+VALID_FORMATS = ("jpeg", "png")
+DEFAULT_FORMAT = "jpeg"
 
 
-class _Fmp4Writer:
-    """Minimal write-only, non-seekable file-like for the PyAV MP4 muxer.
+class ScreenStreamService:
+    """Per-UDID screenshot-loop broadcaster.
 
-    Deliberately exposes NO ``seek``/``tell`` so libav treats the target as a
-    non-seekable stream and emits a fragmented layout (moov first).  Every
-    chunk libav writes is forwarded to the service's fMP4 box parser.
+    A background thread captures ``idb screenshot -`` frames, scales/encodes
+    each to the configured format, and pushes them to every registered WS
+    client.  One instance per UDID is shared by all clients via the registry
+    below.
     """
 
-    def __init__(self, service: "H264StreamService") -> None:
-        self._service = service
+    START_TIMEOUT: float = 10.0      # seconds to wait for the first frame
+    CAPTURE_INTERVAL: float = 0.05   # minimum seconds between capture attempts
+    MAX_CONSECUTIVE_FAILURES: int = 10
 
-    def write(self, data) -> int:
-        b = bytes(data)
-        self._service._feed_bytes(b)
-        return len(b)
-
-    def flush(self) -> None:
-        pass
-
-
-class H264StreamService:
-    """Per-UDID fMP4 broadcaster.  Instances are managed by the WS handler."""
-
-    START_TIMEOUT: float = 10.0  # seconds to wait for the init (moov) segment
-
-    def __init__(self, udid: str) -> None:
+    def __init__(self, udid: str, fmt: str = DEFAULT_FORMAT) -> None:
         self.udid = udid
+        self.fmt = fmt if fmt in VALID_FORMATS else DEFAULT_FORMAT
 
-        self._simctl: Optional[subprocess.Popen] = None
-        self._fifo_path: Optional[str] = None
         self._reader_thread: Optional[threading.Thread] = None
         self._running = False
-
-        # PyAV containers (managed by the reader thread).
-        self._in_container = None
-        self._out_container = None
-
-        # fMP4 box-parser state (fed by the muxer's write callback).
-        self._parse_buffer = b""
-        self._init_accumulator = b""
-        self._init_collected = False
-        self._media_accumulator = b""
-
-        self._lock = threading.Lock()
-        self._init_segment: Optional[bytes] = None  # ftyp(+optional)+moov
-        self._init_ready = threading.Event()
+        self._first_frame = threading.Event()
 
         self._clients_lock = threading.Lock()
         self._clients: Set = set()  # type: ignore[type-arg]
@@ -103,321 +74,192 @@ class H264StreamService:
         if self._running:
             return True
         self._loop = loop
-
-        # Kill any stale simctl recordVideo processes for this UDID before
-        # starting a new one.  Stale processes hold the recording lock, causing
-        # the new simctl to wait indefinitely even with --force.
-        try:
-            result = subprocess.run(
-                ["pkill", "-SIGINT", "-f",
-                 f"simctl io {self.udid} recordVideo"],
-                capture_output=True, timeout=3,
-            )
-            if result.returncode == 0:
-                logger.info(
-                    f"H264StreamService: killed stale simctl recording "
-                    f"for {self.udid}, waiting for release..."
-                )
-                time.sleep(0.8)  # allow the lock to be released
-        except Exception:
-            pass
-
-        # Create a named FIFO.  The reader thread (started next) calls
-        # av.open(FIFO_PATH) so libav opens the read side natively (blocking
-        # O_RDONLY) and probes the MOV container — the proven IdbStreamService
-        # pattern.  simctl --force then connects the write side.
-        fifo_path = f"/tmp/ios_bridge_h264_{self.udid}_{os.getpid()}.pipe"
-        try:
-            if os.path.exists(fifo_path):
-                os.unlink(fifo_path)
-            os.mkfifo(fifo_path, mode=0o600)
-        except Exception as e:
-            logger.error(f"H264StreamService: FIFO creation failed for {self.udid}: {e}")
-            return False
-        self._fifo_path = fifo_path
-
         self._running = True
 
-        # Start the PyAV reader thread FIRST.  It blocks in av.open() until
-        # simctl connects the FIFO write side, then remuxes packets into
-        # fragmented MP4 (see _reader_loop).
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._reader_thread.start()
 
-        # Start simctl recordVideo (writer).  --force overwrites a pre-existing
-        # path; its write-side open rendezvous with the reader's av.open above.
-        try:
-            self._simctl = subprocess.Popen(
-                ["xcrun", "simctl", "io", self.udid,
-                 "recordVideo", "--codec=h264", "--force", fifo_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-        except Exception as e:
-            logger.error(f"H264StreamService: simctl launch failed for {self.udid}: {e}")
-            self.stop()
-            return False
-
-        threading.Thread(
-            target=self._drain_stderr,
-            args=(self._simctl.stderr, "simctl"),
-            daemon=True,
-        ).start()
-
-        # Wait for the init segment so the first client gets it immediately.
-        # Poll periodically to detect early process/reader exit and fail fast.
+        # Wait for the first successful frame so the first client gets data.
         deadline = time.monotonic() + self.START_TIMEOUT
-        while not self._init_ready.is_set():
-            if self._init_ready.wait(timeout=1.0):
+        while not self._first_frame.is_set():
+            if self._first_frame.wait(timeout=1.0):
                 break
             if time.monotonic() >= deadline:
                 logger.warning(
-                    f"H264StreamService: init segment timeout for {self.udid} "
-                    f"(simctl_exit={self._simctl.poll()})"
+                    f"ScreenStreamService: first-frame timeout for {self.udid}"
                 )
                 self.stop()
                 return False
-            simctl_rc = self._simctl.poll()
-            reader_alive = self._reader_thread.is_alive()
-            if simctl_rc is not None or not reader_alive:
+            if self._reader_thread is None or not self._reader_thread.is_alive():
                 logger.error(
-                    f"H264StreamService: process exited early for {self.udid} "
-                    f"(simctl_exit={simctl_rc}, reader_alive={reader_alive})"
+                    f"ScreenStreamService: capture thread died for {self.udid}"
                 )
                 self.stop()
                 return False
 
-        logger.info(f"✅ H264StreamService started for {self.udid}")
+        logger.info(
+            f"✅ ScreenStreamService started for {self.udid} (format={self.fmt})"
+        )
         return True
 
     def stop(self) -> None:
         self._running = False
-        self._cleanup_processes()
         if self._reader_thread:
             self._reader_thread.join(timeout=3)
             self._reader_thread = None
-        logger.info(f"H264StreamService stopped for {self.udid}")
+        logger.info(f"ScreenStreamService stopped for {self.udid}")
 
-    def _cleanup_processes(self) -> None:
-        # simctl needs SIGINT to release the host recording lock cleanly
-        # (same constraint as IdbStreamService).
-        if self._simctl:
-            try:
-                if self._simctl.poll() is None:
-                    self._simctl.send_signal(signal.SIGINT)
-                    try:
-                        self._simctl.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        self._simctl.terminate()
-                        self._simctl.wait(timeout=3)
-            except Exception:
-                try: self._simctl.kill()
-                except Exception: pass
-            self._simctl = None
-
-        # Closing the input container unblocks the reader thread's demux loop.
-        if self._out_container is not None:
-            try:
-                self._out_container.close()
-            except Exception:
-                pass
-            self._out_container = None
-
-        if self._in_container is not None:
-            try:
-                self._in_container.close()
-            except Exception:
-                pass
-            self._in_container = None
-
-        if self._fifo_path:
-            try:
-                os.unlink(self._fifo_path)
-            except Exception:
-                pass
-            self._fifo_path = None
+    @property
+    def is_running(self) -> bool:
+        return (
+            self._running
+            and self._reader_thread is not None
+            and self._reader_thread.is_alive()
+        )
 
     # ------------------------------------------------------------------
-    # Reader / broadcaster
+    # Capture / encode
     # ------------------------------------------------------------------
 
-    def _drain_stderr(self, stream, name: str) -> None:
+    def _capture_once(self) -> Optional[bytes]:
+        """Run ``idb screenshot -`` once and return raw PNG bytes (or None)."""
         try:
-            for line in stream:
-                text = line.decode(errors="replace").strip()
-                if text:
-                    logger.info(f"H264Stream {name}[{self.udid}]: {text}")
-        except Exception:
-            pass
-
-    def _reader_loop(self) -> None:
-        """Demux the simctl MOV (FIFO) with PyAV and remux to fragmented MP4.
-
-        av.open(fifo_path) blocks on the FIFO read-side open until simctl
-        connects the write side, then probes the MOV container — exactly the
-        proven IdbStreamService path.  Packets are bitstream-copied (no
-        transcode) into a fragmented MP4 muxer whose output is captured by
-        ``_Fmp4Writer`` and parsed into MSE init/media segments.
-        """
-        try:
-            logger.info(f"H264StreamService: opening input FIFO with PyAV for {self.udid}")
-            self._in_container = av.open(
-                self._fifo_path,
-                mode="r",
-                format="mov",
-                options={
-                    "fflags": "+nobuffer+discardcorrupt+igndts",
-                    "flags": "+low_delay",
-                    "probesize": "5000000",
-                    "analyzeduration": "5000000",
-                },
+            r = subprocess.run(
+                ["idb", "screenshot", "--udid", self.udid, "-"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=settings.SCREENSHOT_TIMEOUT,
             )
-            in_stream = self._in_container.streams.video[0]
-            logger.info(
-                f"H264StreamService: input opened for {self.udid} "
-                f"(codec={in_stream.codec_context.name}, "
-                f"{in_stream.codec_context.width}x{in_stream.codec_context.height})"
-            )
-
-            self._out_container = av.open(
-                _Fmp4Writer(self),
-                mode="w",
-                format="mp4",
-                options={
-                    "movflags": "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
-                    "frag_duration": str(_FRAG_DURATION_US),
-                    # Force libav to flush its AVIO buffer to our write()
-                    # callback after every packet.  Without this the small
-                    # ftyp+moov init segment sits in the ~32KB output buffer
-                    # until it fills, so MSE clients never get the init in time.
-                    "flush_packets": "1",
-                },
-            )
-            out_stream = self._out_container.add_stream(template=in_stream)
-            logger.info(f"H264StreamService: output muxer ready for {self.udid}, demuxing...")
-
-            pkt_count = 0
-            for packet in self._in_container.demux(in_stream):
-                if not self._running:
-                    break
-                if packet.dts is None:
-                    continue  # flush/incomplete packet
-                packet.stream = out_stream
-                self._out_container.mux(packet)
-                pkt_count += 1
-                if pkt_count <= 3:
-                    logger.info(
-                        f"H264StreamService: muxed packet #{pkt_count} "
-                        f"({packet.size} bytes) for {self.udid}"
-                    )
+            if r.returncode == 0 and r.stdout:
+                return r.stdout
+        except subprocess.TimeoutExpired:
+            logger.debug(f"ScreenStreamService: capture timeout for {self.udid}")
         except Exception as e:
-            logger.error(f"H264StreamService reader error for {self.udid}: {e}")
-        finally:
-            logger.info(f"H264StreamService reader exited for {self.udid}")
+            logger.debug(f"ScreenStreamService: capture error for {self.udid}: {e}")
+        return None
 
-    def _feed_bytes(self, chunk: bytes) -> None:
-        """Parse fragmented-MP4 bytes emitted by the muxer into MSE segments.
+    def _encode(self, png_bytes: bytes) -> Optional[Dict]:
+        """Scale per stream settings and encode to the configured format."""
+        try:
+            with Image.open(io.BytesIO(png_bytes)) as img:
+                if self.fmt == "jpeg":
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                elif img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGBA")
 
-        Called from the muxer's write callback (reader thread).  Caches the
-        init segment (ftyp..moov) and broadcasts each moof+mdat media segment.
-        """
-        if not chunk:
-            return
-        self._parse_buffer += chunk
-        if not self._init_collected:
-            logger.info(
-                f"H264StreamService: muxer wrote {len(chunk)} bytes "
-                f"(buffer={len(self._parse_buffer)}) for {self.udid}"
-            )
+                orig_w, orig_h = img.width, img.height
+                target_w, target_h = orig_w, orig_h
 
-        while len(self._parse_buffer) >= 8:
-            size = int.from_bytes(self._parse_buffer[:4], "big")
-            box_type = self._parse_buffer[4:8].decode("ascii", errors="replace")
+                scale = settings.STREAM_SCALE_FACTOR
+                if 0 < scale < 1.0:
+                    target_w = max(1, int(orig_w * scale))
+                    target_h = max(1, int(orig_h * scale))
 
-            # size==1 (64-bit) / size==0 (to EOF) do not occur in fragmented
-            # MP4 with these flags, but guard against corruption anyway.
-            if size < 8 or size > 64 * 1024 * 1024:
-                logger.warning(
-                    f"H264Stream[{self.udid}]: invalid box size {size} "
-                    f"({box_type!r}); resyncing"
-                )
-                self._parse_buffer = b""
-                return
-            if size > len(self._parse_buffer):
-                return  # need more data
+                max_w = settings.STREAM_MAX_WIDTH
+                if max_w > 0 and target_w > max_w:
+                    ratio = max_w / target_w
+                    target_w = max_w
+                    target_h = max(1, int(target_h * ratio))
 
-            box_data = self._parse_buffer[:size]
-            self._parse_buffer = self._parse_buffer[size:]
+                max_h = settings.STREAM_MAX_HEIGHT
+                if max_h > 0 and target_h > max_h:
+                    ratio = max_h / target_h
+                    target_h = max_h
+                    target_w = max(1, int(target_w * ratio))
 
-            if not self._init_collected:
-                self._init_accumulator += box_data
-                if box_type == "moov":
-                    with self._lock:
-                        self._init_segment = self._init_accumulator
-                    self._init_collected = True
-                    self._init_accumulator = b""
-                    self._init_ready.set()
-            else:
-                # Pair each moof with its following mdat so MSE gets a complete
-                # fragment in a single appendBuffer call.
-                if box_type == "moof":
-                    if self._media_accumulator:
-                        self._broadcast(self._media_accumulator)
-                    self._media_accumulator = box_data
-                elif box_type == "mdat":
-                    self._media_accumulator += box_data
-                    self._broadcast(self._media_accumulator)
-                    self._media_accumulator = b""
+                if (target_w, target_h) != (orig_w, orig_h):
+                    img = img.resize((target_w, target_h), Image.Resampling.BILINEAR)
+
+                out = io.BytesIO()
+                if self.fmt == "jpeg":
+                    img.save(
+                        out,
+                        format="JPEG",
+                        quality=settings.STREAM_JPEG_QUALITY,
+                        optimize=False,
+                    )
                 else:
-                    # styp / sidx / etc.  Prepend to the next pair or pass through.
-                    if self._media_accumulator:
-                        self._media_accumulator = box_data + self._media_accumulator
-                    else:
-                        self._broadcast(box_data)
+                    # compress_level=1: fastest PNG encode (low latency).
+                    img.save(out, format="PNG", compress_level=1)
 
-    def _broadcast(self, data: bytes) -> None:
-        if not self._loop or not data:
+                return {
+                    "data": base64.b64encode(out.getvalue()).decode("utf-8"),
+                    "pixel_width": target_w,
+                    "pixel_height": target_h,
+                }
+        except Exception as e:
+            logger.debug(f"ScreenStreamService: encode error for {self.udid}: {e}")
+            return None
+
+    def _capture_loop(self) -> None:
+        consecutive_failures = 0
+        while self._running:
+            t0 = time.monotonic()
+
+            png = self._capture_once()
+            if not png:
+                consecutive_failures += 1
+                if consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+                    logger.error(
+                        f"ScreenStreamService: too many capture failures "
+                        f"for {self.udid}, stopping"
+                    )
+                    break
+                time.sleep(0.2)
+                continue
+            consecutive_failures = 0
+
+            frame = self._encode(png)
+            if frame is None:
+                continue
+
+            if not self._first_frame.is_set():
+                self._first_frame.set()
+            self._broadcast(frame)
+
+            # Pace the loop so we don't spin faster than CAPTURE_INTERVAL.
+            elapsed = time.monotonic() - t0
+            if elapsed < self.CAPTURE_INTERVAL:
+                time.sleep(self.CAPTURE_INTERVAL - elapsed)
+
+        logger.info(f"ScreenStreamService capture loop exited for {self.udid}")
+
+    # ------------------------------------------------------------------
+    # Broadcast / client management
+    # ------------------------------------------------------------------
+
+    def _broadcast(self, frame: Dict) -> None:
+        if not self._loop:
             return
+        payload = json.dumps({
+            "type": "frame",
+            "format": self.fmt,
+            "data": frame["data"],
+            "pixel_width": frame["pixel_width"],
+            "pixel_height": frame["pixel_height"],
+        })
         with self._clients_lock:
             clients = list(self._clients)
         for ws in clients:
             try:
-                asyncio.run_coroutine_threadsafe(ws.send_bytes(data), self._loop)
+                asyncio.run_coroutine_threadsafe(ws.send_text(payload), self._loop)
             except Exception as e:
-                logger.debug(f"H264 broadcast error for {self.udid}: {e}")
-
-    # ------------------------------------------------------------------
-    # Client management
-    # ------------------------------------------------------------------
+                logger.debug(f"ScreenStream broadcast error for {self.udid}: {e}")
 
     async def add_client(self, websocket) -> bool:
-        """Register a client and send the cached init segment to it."""
-        with self._lock:
-            init = self._init_segment
-        if not init:
-            return False
-        try:
-            await websocket.send_bytes(init)
-        except Exception as e:
-            logger.warning(f"H264 send init failed for {self.udid}: {e}")
+        """Register a client.  Requires the first frame to be available."""
+        if not self._first_frame.is_set():
             return False
         with self._clients_lock:
             self._clients.add(websocket)
         return True
 
     def remove_client(self, websocket) -> int:
-        """Unregister a client. Returns remaining client count."""
+        """Unregister a client.  Returns remaining client count."""
         with self._clients_lock:
             self._clients.discard(websocket)
             return len(self._clients)
-
-    @property
-    def mime_type(self) -> str:
-        return DEFAULT_MSE_MIME
-
-    @property
-    def is_running(self) -> bool:
-        return self._running and (self._simctl is not None and self._simctl.poll() is None)
 
 
 # ----------------------------------------------------------------------
@@ -425,35 +267,41 @@ class H264StreamService:
 # ----------------------------------------------------------------------
 
 _registry_lock = threading.Lock()
-_registry: Dict[str, H264StreamService] = {}
+_registry: Dict[str, ScreenStreamService] = {}
 
 
-def get_or_start_service(udid: str, loop: asyncio.AbstractEventLoop, max_retries: int = 2) -> Optional[H264StreamService]:
+def get_or_start_service(
+    udid: str,
+    loop: asyncio.AbstractEventLoop,
+    fmt: str = DEFAULT_FORMAT,
+    max_retries: int = 2,
+) -> Optional[ScreenStreamService]:
     """Return a running service for the UDID, creating one if needed.
 
-    Retries up to *max_retries* times on start failure (e.g. simctl warm-up
-    delay causing the init-segment timeout to fire on the first attempt).
+    If an existing service uses a different image format, it is restarted with
+    the requested format.  Retries up to *max_retries* times on start failure.
     """
+    fmt = fmt if fmt in VALID_FORMATS else DEFAULT_FORMAT
     for attempt in range(max_retries + 1):
         with _registry_lock:
             svc = _registry.get(udid)
-            if svc is not None and svc.is_running:
+            if svc is not None and svc.is_running and svc.fmt == fmt:
                 return svc
             if svc is not None:
-                # Stale entry; clean up before recreating.
+                # Stale entry or format change; clean up before recreating.
                 svc.stop()
                 _registry.pop(udid, None)
-            svc = H264StreamService(udid)
+            svc = ScreenStreamService(udid, fmt)
         if svc.start(loop):
             with _registry_lock:
                 _registry[udid] = svc
             return svc
         if attempt < max_retries:
             logger.info(
-                f"H264StreamService: retrying start for {udid} "
+                f"ScreenStreamService: retrying start for {udid} "
                 f"(attempt {attempt + 1}/{max_retries})"
             )
-            time.sleep(2.0)
+            time.sleep(1.0)
     return None
 
 

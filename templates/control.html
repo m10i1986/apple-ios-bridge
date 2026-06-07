@@ -1518,7 +1518,16 @@
                 <h3>🎬 WebSocket Type</h3>
                 <div class="mode-toggle controls-grid">
                     <button id="ws-datatype-auto-btn" onclick="setWebSocketDataType('auto')">📺 auto</button>
-                    <button id="ws-datatype-h264-btn" onclick="setWebSocketDataType('h264')" class="active">🎞️ H.264</button>
+                    <button id="ws-datatype-h264-btn" onclick="setWebSocketDataType('h264')" class="active">🎞️ Screen</button>
+                </div>
+                <div class="mode-toggle controls-grid" style="margin-top:6px;">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;">
+                        画像形式:
+                        <select id="h264-format-select" onchange="setH264Format(this.value)">
+                            <option value="jpeg" selected>JPEG（軽量）</option>
+                            <option value="png">PNG（高画質）</option>
+                        </select>
+                    </label>
                 </div>
             </div>
 
@@ -1706,6 +1715,7 @@
         let videoWs = null;
         let screenshotWs = null;
         let h264Ws = null;
+        let h264Format = 'jpeg';  // 'jpeg' or 'png' for the screen stream
         let h264MediaSource = null;
         let h264SourceBuffer = null;
         let h264Queue = [];
@@ -2441,79 +2451,72 @@
             }
         }
 
+        function setH264Format(fmt) {
+            if (fmt !== 'jpeg' && fmt !== 'png') return;
+            if (h264Format === fmt) return;
+            h264Format = fmt;
+            const sel = document.getElementById('h264-format-select');
+            if (sel) sel.value = fmt;
+            // Reconnect with the new format if the screen stream is active.
+            if (currentWsDataType === 'h264' && h264Ws) {
+                try { h264Ws.close(); } catch (e) {}
+                setupH264Stream();
+            }
+        }
+
+        // Screenshot-based screen stream (PNG/JPEG selectable).
+        //
+        // The simulator host cannot provide a real H.264 stream, so this
+        // endpoint now delivers base64-encoded image frames over JSON; we draw
+        // each one onto the canvas (same path as the other image modes).
         function setupH264Stream() {
-            canvas.style.display = 'none';
-            webrtcVideo.style.display = 'block';
+            canvas.style.display = 'block';
+            webrtcVideo.style.display = 'none';
 
-            h264MediaSource = null;
-            h264SourceBuffer = null;
-            h264Queue = [];
-            h264Mime = null;
-
-            h264Ws = new WebSocket(`ws://${location.hostname}:8000/ws/${SESSION_ID}/video_h264`);
-            h264Ws.binaryType = 'arraybuffer';
+            let streamFormat = h264Format;
+            h264Ws = new WebSocket(`ws://${location.hostname}:8000/ws/${SESSION_ID}/video_h264?format=${h264Format}`);
 
             h264Ws.onopen = () => {
-                console.log('H.264 fMP4 WebSocket connected');
-                status.textContent = 'H.264 stream connecting...';
+                console.log('Screen stream WebSocket connected');
+                status.textContent = 'Screen stream connecting...';
                 status.className = 'connected';
             };
 
             h264Ws.onclose = () => {
-                status.textContent = 'H.264 stream disconnected';
+                status.textContent = 'Screen stream disconnected';
                 status.className = 'disconnected';
             };
 
             h264Ws.onerror = (e) => {
-                console.error('H.264 WebSocket error:', e);
-                status.textContent = 'H.264 stream error';
+                console.error('Screen stream WebSocket error:', e);
+                status.textContent = 'Screen stream error';
                 status.className = 'disconnected';
             };
 
             h264Ws.onmessage = (event) => {
-                if (typeof event.data === 'string') {
-                    // JSON init message: {"type":"init","mime":"video/mp4; codecs=\"...\""}
-                    try {
-                        const msg = JSON.parse(event.data);
-                        if (msg.type === 'init') {
-                            h264Mime = msg.mime;
-                            if (!MediaSource.isTypeSupported(h264Mime)) {
-                                console.warn('H.264 mime not supported, trying fallback');
-                                h264Mime = 'video/mp4; codecs="avc1.42E01E"';
-                            }
-                            h264MediaSource = new MediaSource();
-                            webrtcVideo.src = URL.createObjectURL(h264MediaSource);
-                            h264MediaSource.addEventListener('sourceopen', () => {
-                                h264SourceBuffer = h264MediaSource.addSourceBuffer(h264Mime);
-                                h264SourceBuffer.mode = 'segments';
-                                h264SourceBuffer.addEventListener('updateend', () => {
-                                    if (h264Queue.length > 0 && !h264SourceBuffer.updating) {
-                                        h264SourceBuffer.appendBuffer(h264Queue.shift());
-                                    }
-                                });
-                                status.textContent = 'H.264 stream active';
-                            });
-                            webrtcVideo.play().catch(() => {});
-                        }
-                    } catch (e) {
-                        console.error('H.264 JSON parse error:', e);
-                    }
-                } else {
-                    // Binary: init segment or media segment
-                    const chunk = new Uint8Array(event.data);
-                    if (!h264SourceBuffer) {
-                        h264Queue.push(chunk);
-                        return;
-                    }
-                    if (h264SourceBuffer.updating) {
-                        h264Queue.push(chunk);
-                    } else {
-                        try {
-                            h264SourceBuffer.appendBuffer(chunk);
-                        } catch (e) {
-                            console.warn('H.264 appendBuffer error:', e);
-                        }
-                    }
+                if (typeof event.data !== 'string') return;
+                let msg;
+                try {
+                    msg = JSON.parse(event.data);
+                } catch (e) {
+                    return;
+                }
+
+                if (msg.type === 'init') {
+                    streamFormat = msg.format || h264Format;
+                    status.textContent = `Screen stream active (${streamFormat.toUpperCase()})`;
+                    return;
+                }
+
+                if (msg.type === 'frame') {
+                    const mime = (msg.format === 'png') ? 'image/png' : 'image/jpeg';
+                    const img = new Image();
+                    img.onload = () => {
+                        pixelWidth = msg.pixel_width || img.width;
+                        pixelHeight = msg.pixel_height || img.height;
+                        updateCanvasOptimized(img, msg);
+                    };
+                    img.src = `data:${mime};base64,${msg.data}`;
                 }
             };
         }
