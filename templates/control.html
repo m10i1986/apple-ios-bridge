@@ -2388,8 +2388,8 @@
 
             if (mode === 'websocket') {
                 if (currentWsDataType === 'h264') {
-                    canvas.style.display = 'none';
-                    webrtcVideo.style.display = 'block';
+                    canvas.style.display = 'block';
+                    webrtcVideo.style.display = 'none';
                     setupH264Stream();
                 } else {
                     canvas.style.display = 'block';
@@ -2424,8 +2424,8 @@
                 if (videoWs) videoWs.close();
                 if (h264Ws) h264Ws.close();
                 if (type === 'h264') {
-                    canvas.style.display = 'none';
-                    webrtcVideo.style.display = 'block';
+                    canvas.style.display = 'block';
+                    webrtcVideo.style.display = 'none';
                     setupH264Stream();
                 } else {
                     canvas.style.display = 'block';
@@ -2474,7 +2474,7 @@
             webrtcVideo.style.display = 'none';
 
             let streamFormat = h264Format;
-            h264Ws = new WebSocket(`ws://${location.hostname}:8000/ws/${SESSION_ID}/video_h264?format=${h264Format}`);
+            h264Ws = new WebSocket(`ws://${location.hostname}:8000/ws/${SESSION_ID}/video_screen?format=${h264Format}`);
 
             h264Ws.onopen = () => {
                 console.log('Screen stream WebSocket connected');

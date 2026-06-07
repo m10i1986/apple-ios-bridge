@@ -29,7 +29,7 @@ import json
 import subprocess
 import threading
 import time
-from typing import Dict, Optional, Set
+from typing import Dict, Optional
 
 from PIL import Image
 
@@ -62,8 +62,11 @@ class ScreenStreamService:
         self._running = False
         self._first_frame = threading.Event()
 
+        # ws -> asyncio.Queue[str].  The capture thread enqueues encoded frame
+        # payloads; each client's handler coroutine drains its own queue and
+        # awaits send_text (the proven pattern used by the other streams).
         self._clients_lock = threading.Lock()
-        self._clients: Set = set()  # type: ignore[type-arg]
+        self._clients: Dict = {}  # type: ignore[type-arg]
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     # ------------------------------------------------------------------
@@ -240,25 +243,44 @@ class ScreenStreamService:
             "pixel_height": frame["pixel_height"],
         })
         with self._clients_lock:
-            clients = list(self._clients)
-        for ws in clients:
+            queues = list(self._clients.values())
+        for q in queues:
+            # Hand the frame to the event loop thread, which owns the queue.
             try:
-                asyncio.run_coroutine_threadsafe(ws.send_text(payload), self._loop)
+                self._loop.call_soon_threadsafe(self._enqueue, q, payload)
             except Exception as e:
                 logger.debug(f"ScreenStream broadcast error for {self.udid}: {e}")
 
-    async def add_client(self, websocket) -> bool:
-        """Register a client.  Requires the first frame to be available."""
+    @staticmethod
+    def _enqueue(q, payload: str) -> None:
+        """Push the newest frame, dropping the oldest if the client is slow."""
+        try:
+            if q.full():
+                try:
+                    q.get_nowait()
+                except Exception:
+                    pass
+            q.put_nowait(payload)
+        except Exception:
+            pass
+
+    async def add_client(self, websocket):
+        """Register a client and return its frame queue (or None).
+
+        Requires the first frame to be available so the client gets data
+        immediately.  The returned queue is drained by the handler coroutine.
+        """
         if not self._first_frame.is_set():
-            return False
+            return None
+        queue: asyncio.Queue = asyncio.Queue(maxsize=2)
         with self._clients_lock:
-            self._clients.add(websocket)
-        return True
+            self._clients[websocket] = queue
+        return queue
 
     def remove_client(self, websocket) -> int:
         """Unregister a client.  Returns remaining client count."""
         with self._clients_lock:
-            self._clients.discard(websocket)
+            self._clients.pop(websocket, None)
             return len(self._clients)
 
 

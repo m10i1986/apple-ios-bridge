@@ -138,13 +138,18 @@ async def video_websocket(websocket: WebSocket, session_id: str):
         if 'udid' in locals():
             await resource_manager.release_video_service(udid, f"video_ws_{session_id}")
 
+@app.websocket("/ws/{session_id}/video_screen")
 @app.websocket("/ws/{session_id}/video_h264")
 async def video_h264_websocket(websocket: WebSocket, session_id: str):
-    """H.264 fragmented MP4 video WebSocket endpoint.
+    """Screenshot-based screen streaming WebSocket endpoint.
 
-    Streams remuxed H.264 from `xcrun simctl io <udid> recordVideo` as
-    fragmented MP4 binary frames that the browser can feed directly into
-    MediaSource Extensions. No JPEG re-encoding, low CPU, near-native FPS.
+    The simulator host cannot provide a usable realtime H.264 stream, so this
+    endpoint captures frames via `idb screenshot` in a loop and sends them as
+    base64-encoded PNG/JPEG images over JSON. The image format is selectable
+    via the `?format=jpeg|png` query parameter.
+
+    `video_screen` is the canonical path; `video_h264` is kept as a backward-
+    compatible alias.
     """
     try:
         udid = session_manager.get_session_udid(session_id)

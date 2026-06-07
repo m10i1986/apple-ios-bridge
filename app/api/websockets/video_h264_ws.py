@@ -64,21 +64,21 @@ class VideoH264WebSocket:
                 "format": svc.fmt,
             }))
 
-            # 2) Register as a client for broadcast frames.
-            ok = await svc.add_client(websocket)
-            if not ok:
+            # 2) Register as a client; we get a queue the capture thread feeds.
+            queue = await svc.add_client(websocket)
+            if queue is None:
                 logger.warning(f"Screen WS: no frame available yet for {udid}")
                 await websocket.close(code=1011, reason="No frame available")
                 return
 
             logger.info(f"Screen WS client added for {udid} (format={svc.fmt})")
 
-            # 3) Idle: keep the connection open until the client disconnects.
-            #    We don't expect text from the client; ignore anything that comes.
+            # 3) Drain the queue and forward each frame to the client.  When the
+            #    client disconnects, send_text raises and we fall through to
+            #    cleanup.
             while True:
-                msg = await websocket.receive()
-                if msg.get("type") == "websocket.disconnect":
-                    break
+                payload = await queue.get()
+                await websocket.send_text(payload)
         except WebSocketDisconnect:
             pass
         except Exception as e:
