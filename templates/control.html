@@ -1516,10 +1516,12 @@
             <!-- WebSocket Type Section -->
             <div id="websocket-type-section" class="controls-section">
                 <h3>🎬 WebSocket Type</h3>
+                <!--
                 <div class="mode-toggle controls-grid">
                     <button id="ws-datatype-auto-btn" onclick="setWebSocketDataType('auto')">📺 auto</button>
                     <button id="ws-datatype-screen-btn" onclick="setWebSocketDataType('screen')" class="active">🎞️ Screen</button>
                 </div>
+                -->
                 <div class="mode-toggle controls-grid" style="margin-top:6px;">
                     <label style="display:flex;align-items:center;gap:6px;font-size:12px;">
                         画像形式:
@@ -1742,6 +1744,8 @@
         // Performance tracking
         let frameCount = 0;
         let lastFrameTime = 0;
+        let isProcessingFrame = false;
+        let frameDropCount = 0;
         let fpsHistory = [];
         let performanceStats = {
             averageFps: 0,
@@ -2469,6 +2473,7 @@
         function setupScreenStream() {
             canvas.style.display = 'block';
             webrtcVideo.style.display = 'none';
+            isProcessingFrame = false;
 
             let streamFormat = screenFormat;
             screenWs = new WebSocket(`ws://${location.hostname}:8000/ws/${SESSION_ID}/video_screen?format=${screenFormat}`);
@@ -2507,13 +2512,19 @@
                 }
 
                 if (msg.type === 'frame') {
+                    // Drop frame if the previous one is still decoding to
+                    // avoid queueing up Image objects (causes multi-second lag).
+                    if (isProcessingFrame) return;
+                    isProcessingFrame = true;
                     const mime = (msg.format === 'webp') ? 'image/webp' : 'image/jpeg';
                     const img = new Image();
                     img.onload = () => {
                         pixelWidth = msg.pixel_width || img.width;
                         pixelHeight = msg.pixel_height || img.height;
                         updateCanvasOptimized(img, msg);
+                        isProcessingFrame = false;
                     };
+                    img.onerror = () => { isProcessingFrame = false; };
                     img.src = `data:${mime};base64,${msg.data}`;
                 }
             };
