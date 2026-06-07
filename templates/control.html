@@ -2507,6 +2507,9 @@
                 if (msg.type === 'init') {
                     streamFormat = msg.format || screenFormat;
                     streamFormatLabel = streamFormat.toUpperCase();
+                    // Device point dimensions are required for tap coordinate mapping.
+                    if (msg.point_width) pointWidth = msg.point_width;
+                    if (msg.point_height) pointHeight = msg.point_height;
                     status.textContent = `Screen stream active (${streamFormatLabel})`;
                     return;
                 }
@@ -2521,6 +2524,8 @@
                     img.onload = () => {
                         pixelWidth = msg.pixel_width || img.width;
                         pixelHeight = msg.pixel_height || img.height;
+                        if (msg.point_width) pointWidth = msg.point_width;
+                        if (msg.point_height) pointHeight = msg.point_height;
                         updateCanvasOptimized(img, msg);
                         isProcessingFrame = false;
                     };

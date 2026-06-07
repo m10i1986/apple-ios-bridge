@@ -22,6 +22,7 @@ import json
 from fastapi import WebSocket, WebSocketDisconnect
 
 from app.core.logging import logger
+from app.services.device_service import DeviceService
 from app.services.screen_stream_service import (
     VALID_FORMATS,
     DEFAULT_FORMAT,
@@ -57,11 +58,21 @@ class VideoScreenWebSocket:
             await websocket.close(code=1011, reason="Failed to start screen stream")
             return
 
+        # Resolve device point dimensions so the client can map taps.
         try:
-            # 1) Tell the client which image format the frames use.
+            point_width, point_height = await DeviceService(udid).get_point_dimensions()
+        except Exception as e:
+            logger.warning(f"Screen WS: point dimensions unavailable for {udid}: {e}")
+            point_width, point_height = 390, 844
+
+        try:
+            # 1) Tell the client which image format the frames use and the
+            #    device point dimensions needed for tap coordinate mapping.
             await websocket.send_text(json.dumps({
                 "type": "init",
                 "format": svc.fmt,
+                "point_width": point_width,
+                "point_height": point_height,
             }))
 
             # 2) Register as a client; we get a queue the capture thread feeds.
