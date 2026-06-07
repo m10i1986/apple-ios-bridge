@@ -525,7 +525,7 @@
 
 
         function setupControlWebSocket() {
-            controlWs = new WebSocket(`ws://${location.hostname}:8000/ws/control`);
+            controlWs = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.hostname}:8000/ws/control`);
 
             controlWs.onopen = () => {
                 console.log('Control WebSocket connected');
@@ -599,7 +599,7 @@
         }
 
         function setupHighPerformanceVideoStream() {
-            videoWs = new WebSocket(`ws://${location.hostname}:8000/ws/video`);
+            videoWs = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.hostname}:8000/ws/video`);
 
             videoWs.onopen = () => {
                 console.log('Hardware-accelerated video WebSocket connected');
@@ -738,7 +738,7 @@
         }, 5000);
 
         function setupScreenshotMode() {
-            screenshotWs = new WebSocket(`ws://${location.hostname}:8000/ws/screenshot`);
+            screenshotWs = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.hostname}:8000/ws/screenshot`);
 
             screenshotWs.onopen = () => {
                 console.log('Screenshot WebSocket connected');
@@ -1094,7 +1094,7 @@
                 };
 
                 // Set up signaling WebSocket
-                webrtcWs = new WebSocket(`ws://${location.hostname}:8000/ws/webrtc`);
+                webrtcWs = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.hostname}:8000/ws/webrtc`);
 
                 webrtcWs.onopen = async () => {
                     console.log('WebRTC signaling connected');

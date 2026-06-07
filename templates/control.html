@@ -2334,7 +2334,7 @@
 
 
         function setupControlWebSocket() {
-            controlWs = new WebSocket(`ws://${location.hostname}:8000/ws/${SESSION_ID}/control`);
+            controlWs = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.hostname}:8000/ws/${SESSION_ID}/control`);
 
             controlWs.onopen = () => {
                 console.log('Control WebSocket connected');
@@ -2476,7 +2476,7 @@
             isProcessingFrame = false;
 
             let streamFormat = screenFormat;
-            screenWs = new WebSocket(`ws://${location.hostname}:8000/ws/${SESSION_ID}/video_screen?format=${screenFormat}`);
+            screenWs = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.hostname}:8000/ws/${SESSION_ID}/video_screen?format=${screenFormat}`);
 
             screenWs.onopen = () => {
                 console.log('Screen stream WebSocket connected');
@@ -2537,7 +2537,7 @@
 
         function setupHighPerformanceVideoStream() {
             streamFormatLabel = 'JPEG';
-            videoWs = new WebSocket(`ws://${location.hostname}:8000/ws/${SESSION_ID}/video`);
+            videoWs = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.hostname}:8000/ws/${SESSION_ID}/video`);
 
             videoWs.onopen = () => {
                 console.log('Hardware-accelerated video WebSocket connected');
@@ -2677,7 +2677,7 @@
         }, 5000);
 
         function setupScreenshotMode() {
-            screenshotWs = new WebSocket(`ws://${location.hostname}:8000/ws/${SESSION_ID}/screenshot`);
+            screenshotWs = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.hostname}:8000/ws/${SESSION_ID}/screenshot`);
 
             screenshotWs.onopen = () => {
                 console.log('Screenshot WebSocket connected');
@@ -3068,7 +3068,7 @@
                 };
 
                 // Set up signaling WebSocket
-                webrtcWs = new WebSocket(`ws://${location.hostname}:8000/ws/${SESSION_ID}/webrtc`);
+                webrtcWs = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.hostname}:8000/ws/${SESSION_ID}/webrtc`);
 
                 webrtcWs.onopen = async () => {
                     console.log('📡 WebRTC signaling connected');
