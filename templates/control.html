@@ -1518,14 +1518,14 @@
                 <h3>🎬 WebSocket Type</h3>
                 <div class="mode-toggle controls-grid">
                     <button id="ws-datatype-auto-btn" onclick="setWebSocketDataType('auto')">📺 auto</button>
-                    <button id="ws-datatype-h264-btn" onclick="setWebSocketDataType('h264')" class="active">🎞️ Screen</button>
+                    <button id="ws-datatype-screen-btn" onclick="setWebSocketDataType('screen')" class="active">🎞️ Screen</button>
                 </div>
                 <div class="mode-toggle controls-grid" style="margin-top:6px;">
                     <label style="display:flex;align-items:center;gap:6px;font-size:12px;">
                         画像形式:
-                        <select id="h264-format-select" onchange="setH264Format(this.value)">
+                        <select id="screen-format-select" onchange="setScreenFormat(this.value)">
                             <option value="jpeg" selected>JPEG（軽量）</option>
-                            <option value="png">PNG（高画質）</option>
+                            <option value="webp">WEBP（高画質）</option>
                         </select>
                     </label>
                 </div>
@@ -1711,15 +1711,12 @@
         let currentWebRTCQuality = 'high';
 
         let currentMode = 'websocket';
-        let currentWsDataType = 'h264';  // 'auto' or 'h264'
+        let currentWsDataType = 'screen';  // 'auto' or 'screen'
         let videoWs = null;
         let screenshotWs = null;
-        let h264Ws = null;
-        let h264Format = 'jpeg';  // 'jpeg' or 'png' for the screen stream
-        let h264MediaSource = null;
-        let h264SourceBuffer = null;
-        let h264Queue = [];
-        let h264Mime = null;
+        let screenWs = null;
+        let screenFormat = 'jpeg';  // 'jpeg' or 'webp' for the screen stream
+        let streamFormatLabel = 'JPEG';  // current frame format shown in the dimension label
         let controlWs = null;
 
         // WebRTC variables
@@ -2291,7 +2288,7 @@
                 switch (e.key) {
                     case 'w': switchMode('webrtc'); break;
                     case 'v': switchMode('websocket'); break;
-                    case '4': switchMode('h264'); break;
+                    case '4': switchMode('websocket'); break;
                     case 'c': switchMode('screenshot'); break;
                     case 'h': pressButton('home'); break;
                     case 'l': pressButton('lock'); break;
@@ -2379,7 +2376,7 @@
             // Clean up existing connections
             if (videoWs) videoWs.close();
             if (screenshotWs) screenshotWs.close();
-            if (h264Ws) h264Ws.close();
+            if (screenWs) screenWs.close();
             if (webrtcWs) webrtcWs.close();
             if (peerConnection) {
                 peerConnection.close();
@@ -2387,10 +2384,10 @@
             }
 
             if (mode === 'websocket') {
-                if (currentWsDataType === 'h264') {
+                if (currentWsDataType === 'screen') {
                     canvas.style.display = 'block';
                     webrtcVideo.style.display = 'none';
-                    setupH264Stream();
+                    setupScreenStream();
                 } else {
                     canvas.style.display = 'block';
                     webrtcVideo.style.display = 'none';
@@ -2412,9 +2409,9 @@
 
             // Update button highlighting
             document.getElementById('ws-datatype-auto-btn').classList.remove('active');
-            document.getElementById('ws-datatype-h264-btn').classList.remove('active');
-            if (type === 'h264') {
-                document.getElementById('ws-datatype-h264-btn').classList.add('active');
+            document.getElementById('ws-datatype-screen-btn').classList.remove('active');
+            if (type === 'screen') {
+                document.getElementById('ws-datatype-screen-btn').classList.add('active');
             } else {
                 document.getElementById('ws-datatype-auto-btn').classList.add('active');
             }
@@ -2422,11 +2419,11 @@
             // Restart stream if currently in websocket mode
             if (currentMode === 'websocket') {
                 if (videoWs) videoWs.close();
-                if (h264Ws) h264Ws.close();
-                if (type === 'h264') {
+                if (screenWs) screenWs.close();
+                if (type === 'screen') {
                     canvas.style.display = 'block';
                     webrtcVideo.style.display = 'none';
-                    setupH264Stream();
+                    setupScreenStream();
                 } else {
                     canvas.style.display = 'block';
                     webrtcVideo.style.display = 'none';
@@ -2451,49 +2448,49 @@
             }
         }
 
-        function setH264Format(fmt) {
-            if (fmt !== 'jpeg' && fmt !== 'png') return;
-            if (h264Format === fmt) return;
-            h264Format = fmt;
-            const sel = document.getElementById('h264-format-select');
+        function setScreenFormat(fmt) {
+            if (fmt !== 'jpeg' && fmt !== 'webp') return;
+            if (screenFormat === fmt) return;
+            screenFormat = fmt;
+            const sel = document.getElementById('screen-format-select');
             if (sel) sel.value = fmt;
             // Reconnect with the new format if the screen stream is active.
-            if (currentWsDataType === 'h264' && h264Ws) {
-                try { h264Ws.close(); } catch (e) {}
-                setupH264Stream();
+            if (currentWsDataType === 'screen' && screenWs) {
+                try { screenWs.close(); } catch (e) {}
+                setupScreenStream();
             }
         }
 
-        // Screenshot-based screen stream (PNG/JPEG selectable).
+        // Screenshot-based screen stream (JPEG/WEBP selectable).
         //
         // The simulator host cannot provide a real H.264 stream, so this
         // endpoint now delivers base64-encoded image frames over JSON; we draw
         // each one onto the canvas (same path as the other image modes).
-        function setupH264Stream() {
+        function setupScreenStream() {
             canvas.style.display = 'block';
             webrtcVideo.style.display = 'none';
 
-            let streamFormat = h264Format;
-            h264Ws = new WebSocket(`ws://${location.hostname}:8000/ws/${SESSION_ID}/video_screen?format=${h264Format}`);
+            let streamFormat = screenFormat;
+            screenWs = new WebSocket(`ws://${location.hostname}:8000/ws/${SESSION_ID}/video_screen?format=${screenFormat}`);
 
-            h264Ws.onopen = () => {
+            screenWs.onopen = () => {
                 console.log('Screen stream WebSocket connected');
                 status.textContent = 'Screen stream connecting...';
                 status.className = 'connected';
             };
 
-            h264Ws.onclose = () => {
+            screenWs.onclose = () => {
                 status.textContent = 'Screen stream disconnected';
                 status.className = 'disconnected';
             };
 
-            h264Ws.onerror = (e) => {
+            screenWs.onerror = (e) => {
                 console.error('Screen stream WebSocket error:', e);
                 status.textContent = 'Screen stream error';
                 status.className = 'disconnected';
             };
 
-            h264Ws.onmessage = (event) => {
+            screenWs.onmessage = (event) => {
                 if (typeof event.data !== 'string') return;
                 let msg;
                 try {
@@ -2503,13 +2500,14 @@
                 }
 
                 if (msg.type === 'init') {
-                    streamFormat = msg.format || h264Format;
-                    status.textContent = `Screen stream active (${streamFormat.toUpperCase()})`;
+                    streamFormat = msg.format || screenFormat;
+                    streamFormatLabel = streamFormat.toUpperCase();
+                    status.textContent = `Screen stream active (${streamFormatLabel})`;
                     return;
                 }
 
                 if (msg.type === 'frame') {
-                    const mime = (msg.format === 'png') ? 'image/png' : 'image/jpeg';
+                    const mime = (msg.format === 'webp') ? 'image/webp' : 'image/jpeg';
                     const img = new Image();
                     img.onload = () => {
                         pixelWidth = msg.pixel_width || img.width;
@@ -2522,6 +2520,7 @@
         }
 
         function setupHighPerformanceVideoStream() {
+            streamFormatLabel = 'JPEG';
             videoWs = new WebSocket(`ws://${location.hostname}:8000/ws/${SESSION_ID}/video`);
 
             videoWs.onopen = () => {
@@ -2651,7 +2650,7 @@
             ctx.drawImage(img, 0, 0, displayWidth, displayHeight);
 
             // Update dimension info
-            dimensionInfo.textContent = `Pixels: ${pixelWidth}×${pixelHeight} | Points: ${pointWidth}×${pointHeight} | Display: ${displayWidth}×${displayHeight} | JPEG`;
+            dimensionInfo.textContent = `Pixels: ${pixelWidth}×${pixelHeight} | Points: ${pointWidth}×${pointHeight} | Display: ${displayWidth}×${displayHeight} | ${streamFormatLabel}`;
         }
 
         // Add frame rate monitoring

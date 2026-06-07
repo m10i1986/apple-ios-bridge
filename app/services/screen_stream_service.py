@@ -14,9 +14,9 @@ WebSocket clients as a JSON message carrying a base64-encoded image.
 
 The output image format is selectable per stream:
     - "jpeg" (default): smaller, lossy, lower latency / bandwidth.
-    - "png":            lossless, larger.
+    - "webp":           better compression than PNG, supports lossless/lossy.
 
-This module keeps the public surface used by the ``video_h264`` WebSocket
+This module keeps the public surface used by the ``video_screen`` WebSocket
 handler (``get_or_start_service`` / ``release_service_if_idle`` and the
 ``add_client`` / ``remove_client`` instance methods) so the endpoint wiring is
 unchanged.
@@ -37,7 +37,7 @@ from app.config.settings import settings
 from app.core.logging import logger
 
 
-VALID_FORMATS = ("jpeg", "png")
+VALID_FORMATS = ("jpeg", "webp")
 DEFAULT_FORMAT = "jpeg"
 
 
@@ -183,8 +183,13 @@ class ScreenStreamService:
                         optimize=False,
                     )
                 else:
-                    # compress_level=1: fastest PNG encode (low latency).
-                    img.save(out, format="PNG", compress_level=1)
+                    # WEBP: much smaller than PNG; quality reuses JPEG setting.
+                    img.save(
+                        out,
+                        format="WEBP",
+                        quality=settings.STREAM_JPEG_QUALITY,
+                        method=0,
+                    )
 
                 return {
                     "data": base64.b64encode(out.getvalue()).decode("utf-8"),

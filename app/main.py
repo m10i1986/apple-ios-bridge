@@ -20,7 +20,7 @@ from app.api.websockets.control_ws import ControlWebSocket
 from app.api.websockets.video_ws import VideoWebSocket
 from app.api.websockets.screenshot_ws import ScreenshotWebSocket
 from app.api.websockets.webrtc_ws import WebRTCWebSocket
-from app.api.websockets.video_h264_ws import VideoH264WebSocket
+from app.api.websockets.video_screen_ws import VideoScreenWebSocket
 from app.services.fast_webrtc_service import FastWebRTCService
 from app.services.connection_manager import connection_manager, managed_connection
 from app.services.resource_manager import resource_manager
@@ -140,13 +140,13 @@ async def video_websocket(websocket: WebSocket, session_id: str):
 
 @app.websocket("/ws/{session_id}/video_screen")
 @app.websocket("/ws/{session_id}/video_h264")
-async def video_h264_websocket(websocket: WebSocket, session_id: str):
+async def video_screen_websocket(websocket: WebSocket, session_id: str):
     """Screenshot-based screen streaming WebSocket endpoint.
 
     The simulator host cannot provide a usable realtime H.264 stream, so this
     endpoint captures frames via `idb screenshot` in a loop and sends them as
-    base64-encoded PNG/JPEG images over JSON. The image format is selectable
-    via the `?format=jpeg|png` query parameter.
+    base64-encoded JPEG/WEBP images over JSON. The image format is selectable
+    via the `?format=jpeg|webp` query parameter.
 
     `video_screen` is the canonical path; `video_h264` is kept as a backward-
     compatible alias.
@@ -161,14 +161,14 @@ async def video_h264_websocket(websocket: WebSocket, session_id: str):
         await websocket.accept()
 
         client_ip = getattr(websocket.client, 'host', None) if websocket.client else None
-        async with managed_connection(session_id, "video_h264_websocket", websocket, client_ip):
-            handler = VideoH264WebSocket()
+        async with managed_connection(session_id, "video_screen_websocket", websocket, client_ip):
+            handler = VideoScreenWebSocket()
             await handler.handle_connection(websocket, udid)
 
     except WebSocketDisconnect:
-        logger.info(f"H264 video WebSocket disconnected for session: {session_id}")
+        logger.info(f"Screen video WebSocket disconnected for session: {session_id}")
     except Exception as e:
-        logger.error(f"H264 video WebSocket error for session {session_id}: {e}")
+        logger.error(f"Screen video WebSocket error for session {session_id}: {e}")
 
 @app.websocket("/ws/{session_id}/webrtc")
 async def webrtc_websocket(websocket: WebSocket, session_id: str):

@@ -2,17 +2,17 @@
 
 Wire format (all messages are JSON text frames):
     1. On connect: server sends
-         {"type": "init", "format": "jpeg" | "png"}
+         {"type": "init", "format": "jpeg" | "webp"}
        so the client knows how to decode the image data that follows.
     2. Then: for every captured frame, the server sends
          {"type": "frame", "format": "...", "data": "<base64>",
           "pixel_width": <int>, "pixel_height": <int>}
-       where "data" is a base64-encoded JPEG or PNG image.
+       where "data" is a base64-encoded JPEG or WEBP image.
 
 The client decodes each frame and draws it onto a canvas.  This handler does
 not consume any messages from the client.
 
-The output image format is selectable via the ``?format=jpeg|png`` query
+The output image format is selectable via the ``?format=jpeg|webp`` query
 parameter (defaults to "jpeg").
 """
 
@@ -22,7 +22,7 @@ import json
 from fastapi import WebSocket, WebSocketDisconnect
 
 from app.core.logging import logger
-from app.services.h264_stream_service import (
+from app.services.screen_stream_service import (
     VALID_FORMATS,
     DEFAULT_FORMAT,
     get_or_start_service,
@@ -30,12 +30,12 @@ from app.services.h264_stream_service import (
 )
 
 
-class VideoH264WebSocket:
+class VideoScreenWebSocket:
     """Per-connection screen-stream WebSocket handler.
 
     The underlying capture pipeline (``idb screenshot`` loop) is shared across
     all clients for the same UDID via the service registry in
-    h264_stream_service.
+    screen_stream_service.
     """
 
     async def handle_connection(self, websocket: WebSocket, udid: str) -> None:
