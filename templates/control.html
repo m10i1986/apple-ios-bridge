@@ -1301,6 +1301,11 @@
                         <span class="icon">🔄</span>
                         <span class="label">Portrait</span>
                     </button>
+
+                    <button class="device-control-btn" onclick="toggleActualSize()" id="actualSizeBtn">
+                        <span class="icon">🔍</span>
+                        <span class="label">1:1</span>
+                    </button>
                 </div>
             </div>
         </div>
@@ -1740,6 +1745,10 @@
         // Gesture mode
         let swipeMode = false;
         let swipeStart = null;
+
+        // Actual size (1:1 point) toggle
+        let actualSizeMode = false;
+        let lastCanvasImage = null;
 
         // Performance tracking
         let frameCount = 0;
@@ -2627,24 +2636,46 @@
             img.src = `data:image/jpeg;base64,${data.data}`;
         }
 
-        function updateCanvasOptimized(img, data) {
-            // Calculate display size with better performance
+        // Compute display size.
+        // Fit mode: scales to viewport width / max-height while preserving aspect ratio.
+        // Actual-size mode: renders at 1:1 device point resolution.
+        function computeDisplaySize() {
+            if (actualSizeMode) {
+                return { displayWidth: pointWidth, displayHeight: pointHeight };
+            }
             const screenContainer = document.querySelector('.screen-container');
-            const containerWidth = screenContainer.clientWidth - 4; // Account for border
-            const devicePixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+            const containerWidth = screenContainer.clientWidth - 4;
             const aspectRatio = pixelWidth / pixelHeight;
-
-            let displayWidth = Math.min(containerWidth, 400);
+            let displayWidth = containerWidth;
             let displayHeight = displayWidth / aspectRatio;
-
-            const maxHeight = window.innerHeight * 0.6;
+            const maxHeight = window.innerHeight * 0.85;
             if (displayHeight > maxHeight) {
                 displayHeight = maxHeight;
                 displayWidth = displayHeight * aspectRatio;
             }
+            return { displayWidth: Math.round(displayWidth), displayHeight: Math.round(displayHeight) };
+        }
 
-            displayWidth = Math.round(displayWidth);
-            displayHeight = Math.round(displayHeight);
+        // Toggle fit ⇔ actual-size (1:1 point) display mode.
+        function toggleActualSize() {
+            actualSizeMode = !actualSizeMode;
+            const screenContainer = document.querySelector('.screen-container');
+            const btn = document.getElementById('actualSizeBtn');
+            if (screenContainer) {
+                screenContainer.style.overflowY = actualSizeMode ? 'auto' : 'visible';
+            }
+            if (btn) {
+                const label = btn.querySelector('.label');
+                if (label) label.textContent = actualSizeMode ? 'Fit' : '1:1';
+            }
+            // Re-render with the stored last frame
+            if (lastCanvasImage) updateCanvasOptimized(lastCanvasImage, null);
+        }
+
+        function updateCanvasOptimized(img, data) {
+            lastCanvasImage = img;
+            const devicePixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+            const { displayWidth, displayHeight } = computeDisplaySize();
 
             // Only resize canvas if dimensions changed
             const newCanvasWidth = displayWidth * devicePixelRatio;
@@ -2668,6 +2699,16 @@
             // Update dimension info
             dimensionInfo.textContent = `Pixels: ${pixelWidth}×${pixelHeight} | Points: ${pointWidth}×${pointHeight} | Display: ${displayWidth}×${displayHeight} | ${streamFormatLabel}`;
         }
+
+        // Fit mode: re-render on resize so the canvas tracks the new viewport size.
+        let resizeTimer = null;
+        window.addEventListener('resize', () => {
+            if (actualSizeMode) return;
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => {
+                if (lastCanvasImage) updateCanvasOptimized(lastCanvasImage, null);
+            }, 100);
+        });
 
         // Add frame rate monitoring
         setInterval(() => {
